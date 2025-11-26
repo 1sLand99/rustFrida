@@ -2,12 +2,6 @@ use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
-    // 编译 C 代码
-    cc::Build::new()
-        .file("src/transform.c")
-        .compile("my_c_lib");
-
-    // 编译 eBPF 程序
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()
@@ -29,7 +23,5 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())?;
-
-    Ok(())
+    aya_build::build_ebpf([ebpf_package], Toolchain::default())
 }

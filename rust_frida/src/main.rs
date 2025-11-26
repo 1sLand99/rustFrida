@@ -415,9 +415,17 @@ fn call_target_function(pid: i32, func_addr: usize, args: &[usize], debug: Optio
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// 目标进程的PID
-    #[arg(short, long)]
-    pid: i32,
+    /// 目标进程的PID（与 --watch-so 互斥）
+    #[arg(short, long, required_unless_present = "watch_so")]
+    pid: Option<i32>,
+
+    /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程
+    #[arg(short = 'w', long = "watch-so")]
+    watch_so: Option<String>,
+
+    /// 监听超时时间（秒），默认无限等待
+    #[arg(short = 't', long = "timeout")]
+    timeout: Option<u64>,
 }
 
 fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, String> {
@@ -629,14 +637,147 @@ fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), String> {
     )
 }
 
+/// 注入 agent 到目标进程
+fn inject_to_process(pid: i32) -> Result<(), String> {
+    println!("正在附加到进程 PID: {}", pid);
+
+    // 获取自身和目标进程的 libc 基址
+    let self_base = get_libc_base(None)?;
+    let target_base = get_libc_base(Some(pid))?;
+    let self_dl_base = get_dl_base(None)?;
+    let target_dl_base = get_dl_base(Some(pid))?;
+
+    println!("自身 libc.so 基址: 0x{:x}", self_base);
+    println!("目标进程 libc.so 基址: 0x{:x}", target_base);
+    println!("自身 libdl.so 基址: 0x{:x}", self_dl_base);
+    println!("目标进程 libdl.so 基址: 0x{:x}", target_dl_base);
+
+    // 计算目标进程中的函数地址
+    let offsets = LibcOffsets::calculate(self_base, target_base);
+    let dl_offsets = DlOffsets::calculate(self_dl_base, target_dl_base);
+
+    // 打印所有函数地址
+    offsets.print_offsets();
+    dl_offsets.print_offsets();
+
+    // 附加到目标进程
+    attach_to_process(pid)?;
+    println!("附加成功，开始分配内存");
+
+    // 分配内存用于shellcode
+    let page_size = 4096;
+    let shellcode_len = ((SHELLCODE.len() + page_size - 1) / page_size) * page_size;
+    let mmap_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    let mmap_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let shellcode_addr = call_target_function(
+        pid,
+        offsets.mmap,
+        &[
+            0, // addr = NULL，让内核分配
+            shellcode_len,
+            mmap_prot as usize,
+            mmap_flags as usize,
+            !0usize, // fd = -1
+            0,       // offset = 0
+        ], None
+    ).map_err(|e| format!("调用 mmap 失败: {}", e))?;
+
+    println!("分配shellcode内存地址: 0x{:x}", shellcode_addr);
+
+    // 写入shellcode
+    write_bytes(pid, shellcode_addr, SHELLCODE)?;
+    println!("Shellcode写入成功，地址: 0x{:x}", shellcode_addr);
+
+    // 分配内存用于LibcOffsets结构体
+    let offsets_size = size_of::<LibcOffsets>();
+    let offsets_addr = call_target_function(pid, offsets.malloc, &[offsets_size], None)
+        .map_err(|e| format!("分配offsets内存失败: {}", e))?;
+
+    println!("分配offsets内存地址: 0x{:x}", offsets_addr);
+
+    // 写入LibcOffsets结构体
+    write_memory(pid, offsets_addr, &offsets)?;
+    println!("Offsets写入成功，地址: 0x{:x}", offsets_addr);
+
+    let dloffset_size = size_of::<DlOffsets>();
+    let dloffset_addr = call_target_function(pid, offsets.malloc, &[dloffset_size], None)
+        .map_err(|e| format!("分配dloffsets内存失败: {}", e))?;
+
+    println!("分配dloffsets内存地址: 0x{:x}", dloffset_addr);
+
+    // 写入DlOffsets结构体
+    write_memory(pid, dloffset_addr, &dl_offsets)?;
+    println!("DlOffsets写入成功，地址: 0x{:x}", dloffset_addr);
+
+    // 写入字符串表
+    let string_table_addr = write_string_table(pid, offsets.malloc)?;
+    println!("字符串表写入成功，地址: 0x{:x}", string_table_addr);
+
+    // 使用 call_target_function 调用 shellcode
+    match call_target_function(pid, shellcode_addr, &[offsets_addr, dloffset_addr, string_table_addr], None) {
+        Ok(return_value) => {
+            println!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
+
+            // 释放shellcode内存
+            println!("正在释放shellcode内存...");
+            match call_target_function(
+                pid,
+                offsets.munmap,
+                &[shellcode_addr, shellcode_len],
+                None
+            ) {
+                Ok(_) => println!("Shellcode内存释放成功"),
+                Err(e) => eprintln!("释放shellcode内存失败: {}", e),
+            }
+
+            // detach 目标进程
+            if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
+                eprintln!("分离目标进程失败: {}", e);
+            } else {
+                println!("已分离目标进程");
+            }
+            Ok(())
+        },
+        Err(e) => {
+            eprintln!("执行 shellcode 失败: {}", e);
+            println!("暂停目标进程，等待调试器附加...");
+            // 发送 SIGSTOP 让目标进程暂停
+            let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
+            Err(e)
+        }
+    }
+}
+
+/// 使用 eBPF 监听 SO 加载并自动附加
+fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>) -> Result<(), String> {
+    use ldmonitor::DlopenMonitor;
+    use std::time::Duration;
+
+    println!("正在启动 eBPF 监听器，等待加载: {}", so_pattern);
+
+    let monitor = DlopenMonitor::new(None)
+        .map_err(|e| format!("启动 eBPF 监听失败: {}", e))?;
+
+    let info = if let Some(secs) = timeout_secs {
+        println!("超时时间: {} 秒", secs);
+        monitor.wait_for_path_timeout(so_pattern, Duration::from_secs(secs))
+    } else {
+        println!("无超时限制，持续监听中...");
+        monitor.wait_for_path(so_pattern)
+    };
+
+    match info {
+        Some(dlopen_info) => {
+            println!("检测到 SO 加载: pid={}, path={}", dlopen_info.pid, dlopen_info.path);
+            inject_to_process(dlopen_info.pid as i32)
+        }
+        None => Err("监听超时，未检测到匹配的 SO 加载".to_string())
+    }
+}
+
 fn main() {
     let args = Args::parse();
-    
-    if args.pid <= 0 {
-        eprintln!("错误: PID必须是正整数");
-        process::exit(1);
-    }
-    
+
     // 初始化 agent.so 的 memfd
     match create_memfd_with_data("wwb_so", AGENT_SO) {
         Ok(fd) => {
@@ -648,161 +789,29 @@ fn main() {
             process::exit(1);
         }
     }
-    
-    println!("正在附加到进程 PID: {}", args.pid);
-    
+
     // 启动抽象套接字监听
     let handle = start_socket_listener("rust_frida_socket");
-    
-    // 获取自身和目标进程的 libc 基址
-    match (get_libc_base(None), get_libc_base(Some(args.pid)), get_dl_base(None), get_dl_base(Some(args.pid))) {
-        (Ok(self_base), Ok(target_base), Ok(self_dl_base), Ok(target_dl_base)) => {
-            println!("自身 libc.so 基址: 0x{:x}", self_base);
-            println!("目标进程 libc.so 基址: 0x{:x}", target_base);
-            println!("自身 libdl.so 基址: 0x{:x}", self_dl_base);
-            println!("目标进程 libdl.so 基址: 0x{:x}", target_dl_base);
-            
-            // 计算目标进程中的函数地址
-            let offsets = LibcOffsets::calculate(self_base, target_base);
-            let dl_offsets = DlOffsets::calculate(self_dl_base, target_dl_base);
-            
-            // 打印所有函数地址
-            offsets.print_offsets();
-            dl_offsets.print_offsets();
-            
-            // 附加到目标进程
-            match attach_to_process(args.pid) {
-                Ok(_) => {
-                    println!("附加成功，开始分配内存");
-                    
-                    // 分配内存用于shellcode
-                    let page_size = 4096;
-                    let shellcode_len = ((SHELLCODE.len() + page_size - 1) / page_size) * page_size;
-                    let mmap_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-                    let mmap_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-                    let shellcode_addr = match call_target_function(
-                        args.pid,
-                        offsets.mmap,
-                        &[
-                            0, // addr = NULL，让内核分配
-                            shellcode_len,
-                            mmap_prot as usize,
-                            mmap_flags as usize,
-                            !0usize, // fd = -1
-                            0,       // offset = 0
-                        ], None
-                    ) {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            eprintln!("调用 mmap 失败: {}", e);
-                            process::exit(1);
-                        },
-                    };
-                    
-                    println!("分配shellcode内存地址: 0x{:x}", shellcode_addr);
-                    
-                    // 写入shellcode
-                    if let Err(e) = write_bytes(args.pid, shellcode_addr, SHELLCODE) {
-                        eprintln!("写入shellcode失败: {}", e);
-                        process::exit(1);
-                    }
-                    
-                    println!("Shellcode写入成功，地址: 0x{:x}", shellcode_addr);
-                    
-                    // 分配内存用于LibcOffsets结构体
-                    let offsets_size = size_of::<LibcOffsets>();
-                    let offsets_addr = match call_target_function(args.pid, offsets.malloc, &[offsets_size],None) {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            eprintln!("分配offsets内存失败: {}", e);
-                            process::exit(1);
-                        },
-                    };
-                    
-                    println!("分配offsets内存地址: 0x{:x}", offsets_addr);
-                    
-                    // 写入LibcOffsets结构体
-                    if let Err(e) = write_memory(args.pid, offsets_addr, &offsets) {
-                        eprintln!("写入offsets失败: {}", e);
-                        process::exit(1);
-                    }
-                    
-                    println!("Offsets写入成功，地址: 0x{:x}", offsets_addr);
 
-                    let dloffset_size = size_of::<DlOffsets>();
-                    let dloffset_addr = match call_target_function(args.pid, offsets.malloc, &[dloffset_size],None) {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            eprintln!("分配dloffsets内存失败: {}", e);
-                            process::exit(1);
-                        },
-                    };
+    // 根据参数选择注入方式
+    let result = if let Some(so_pattern) = &args.watch_so {
+        // 使用 eBPF 监听 SO 加载
+        watch_and_inject(so_pattern, args.timeout)
+    } else if let Some(pid) = args.pid {
+        // 直接附加到指定 PID
+        if pid <= 0 {
+            eprintln!("错误: PID必须是正整数");
+            process::exit(1);
+        }
+        inject_to_process(pid)
+    } else {
+        eprintln!("错误: 必须指定 --pid 或 --watch-so");
+        process::exit(1);
+    };
 
-                    println!("分配dloffsets内存地址: 0x{:x}", dloffset_addr);
-
-                    // 写入DlOffsets结构体
-                    if let Err(e) = write_memory(args.pid, dloffset_addr, &dl_offsets) {
-                        eprintln!("写入dloffsets失败: {}", e);
-                        process::exit(1);
-                    }
-
-                    println!("DlOffsets写入成功，地址: 0x{:x}", dloffset_addr);
-
-                    // 写入字符串表
-                    let string_table_addr = match write_string_table(args.pid, offsets.malloc){
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            eprintln!("写入字符串表失败: {}", e);
-                            process::exit(1);
-                        }
-                    };
-                    
-                    println!("字符串表写入成功，地址: 0x{:x}", string_table_addr);
-                    
-                    // 使用 call_target_function 调用 shellcode
-                    match call_target_function(args.pid, shellcode_addr, &[offsets_addr, dloffset_addr, string_table_addr],None) {
-                        Ok(return_value) => {
-                            println!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
-                            
-                            // 释放shellcode内存
-                            println!("正在释放shellcode内存...");
-                            match call_target_function(
-                                args.pid,
-                                offsets.munmap,
-                                &[shellcode_addr, shellcode_len],
-                                None
-                            ) {
-                                Ok(_) => println!("Shellcode内存释放成功"),
-                                Err(e) => eprintln!("释放shellcode内存失败: {}", e),
-                            }
-                            
-                            // detach 目标进程
-                            if let Err(e) = ptrace::detach(Pid::from_raw(args.pid), None) {
-                                eprintln!("分离目标进程失败: {}", e);
-                            } else {
-                                println!("已分离目标进程");
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("执行 shellcode 失败: {}", e);
-                            println!("暂停目标进程，等待调试器附加...");
-                            // 发送 SIGSTOP 让目标进程暂停
-                            let _ = ptrace::cont(Pid::from_raw(args.pid), Some(Signal::SIGSTOP));
-                            process::exit(1);
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("错误: {}", e);
-                    process::exit(1);
-                }
-            }
-        },
-        (Err(e), _, _, _) => eprintln!("获取自身libc基址失败: {}", e),
-        (_, Err(e), _, _) => eprintln!("获取目标进程libc基址失败: {}", e),
-        (_, _, Err(e), _) => eprintln!("获取自身libdl基址失败: {}", e),
-        (_, _, _, Err(e)) => eprintln!("获取目标进程libdl基址失败: {}", e),
-        
+    if let Err(e) = result {
+        eprintln!("注入失败: {}", e);
+        process::exit(1);
     }
 
     loop {
@@ -833,7 +842,7 @@ fn main() {
     }
     // 等待监听线程退出
     handle.unwrap().join().unwrap();
-    
+
     // 清理资源
     let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
     if memfd >= 0 {
