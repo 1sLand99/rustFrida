@@ -7,11 +7,11 @@ mod stalker;
 
 use crate::gumlibc::{gum_libc_ptrace, gum_libc_waitpid};
 use crate::jhook::jhook;
-use libc::{c_char, c_int, close, iovec, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, PTRACE_DETACH, SIGSTOP, _SC_PAGESIZE,SIGCONT};
+use libc::{c_char, c_int, close, iovec, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX, CLONE_SETTLS, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, PTRACE_DETACH, SIGSTOP, _SC_PAGESIZE, SIGCONT, sleep, free};
 use libc::{PTRACE_ATTACH, PTRACE_GETREGSET, PTRACE_CONT};
 use nix::errno::Errno;
 use once_cell::unsync::Lazy;
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 use std::fmt::format;
 use std::io::Write;
 use std::io::{Error, Read};
@@ -22,7 +22,11 @@ use std::process;
 use std::ptr;
 use std::ptr::null_mut;
 use std::sync::{ Mutex, OnceLock};
+use std::thread::sleep_ms;
+use std::time::Duration;
+// use nix::unistd::chflags;
 use stalker::follow;
+use crate::stalker::hfollow;
 
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
@@ -493,18 +497,54 @@ fn arm64_cond_pass(cond: u8, pstate: usize) -> bool {
 }
 
 static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
+static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 日志函数：socket未连接时缓存，已连接时直接发送
+fn log_msg(msg: &str) {
+    match GLOBAL_STREAM.get() {
+        Some(mut stream) => {
+            let _ = stream.write_all(msg.as_bytes());
+        }
+        None => {
+            // Socket未连接，缓存日志
+            if let Ok(mut cache) = CACHE_LOG.lock() {
+                cache.push(msg.to_string());
+            }
+        }
+    }
+}
+
+/// 刷新缓存的日志，在socket连接后调用
+fn flush_cached_logs() {
+    if let Some(mut stream) = GLOBAL_STREAM.get() {
+        if let Ok(mut cache) = CACHE_LOG.lock() {
+            for msg in cache.drain(..) {
+                let _ = stream.write_all(msg.as_bytes());
+            }
+        }
+    }
+}
 #[no_mangle]
-pub extern "C" fn hello_entry(){
+pub extern "C" fn hello_entry(cmdline:*const c_char) {
+    unsafe {
+        let cmd = CStr::from_ptr(cmdline).to_str().unwrap();
+        if cmd != "novalue"{
+            process_cmd(cmd) ;
+        }
+    }
+
     unsafe {
         let name = std::ffi::CString::new("wwb").unwrap();
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
+
     // GLOBAL_STREAM.lock().unwrap().set(connect_socket().unwrap()).unwrap();
     GLOBAL_STREAM.set(connect_socket().expect("wwb connect socket failed!!!")).unwrap();
     let mut stream = GLOBAL_STREAM.get().unwrap();
-    
     let _ = stream.write("HELLO_AGENT".as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    flush_cached_logs();
     
     // 循环等待stream发送命令
     let mut buffer = [0u8; 1024];
@@ -513,41 +553,9 @@ pub extern "C" fn hello_entry(){
             Ok(size) if size > 0 => {
                 // 处理接收到的命令
                 let command = std::str::from_utf8(&buffer[0..size]).unwrap_or("无效命令");
+                // let _ = stream.write(format!("收到命令: {}", command).as_bytes()).unwrap();
                 // 可以在这里添加命令处理逻辑
-                let _ = stream.write(format!("收到命令: {}", command).as_bytes()).unwrap();
-                match command.split_whitespace().next() {
-                    Some("trace") => {
-                        let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        std::thread::spawn(move || {
-                            match gum_modify_thread(tid) {
-                                Ok(pid) => {
-                                    GLOBAL_STREAM.get().unwrap().write_all(format!("clone success {}",pid).as_bytes()).unwrap();
-                                }
-                                Err(e) => {
-                                    GLOBAL_STREAM.get().unwrap().write_all(format!("error: {}", e).as_bytes()).unwrap();
-                                }
-                            }
-                            unsafe { kill(process::id() as pid_t, SIGSTOP ) }
-                        });
-                    },
-                    Some("jhook") => {
-                        std::thread::spawn(|| {
-                            match jhook() {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    GLOBAL_STREAM.get().unwrap().write_all(format!("{}", e).as_bytes()).unwrap();
-                                }
-                            }
-                        });
-                    },
-                    Some("stalker") => {
-                        let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        follow(tid)
-                    },
-                    _ => {
-                        stream.write_all(format!("无效命令: {}", command).as_bytes()).unwrap();
-                    }
-                }
+                process_cmd(command);
             },
             Ok(_) => {
                 // 连接关闭
@@ -558,6 +566,52 @@ pub extern "C" fn hello_entry(){
                 stream.write_all(format!("读取命令错误: {}", e).as_bytes()).unwrap();
                 break;
             }
+        }
+    }
+}
+
+fn process_cmd(command: &str) {
+    match command.split_whitespace().next() {
+        Some("trace") => {
+            let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            std::thread::spawn(move || {
+                match gum_modify_thread(tid) {
+                    Ok(pid) => {
+                        GLOBAL_STREAM.get().unwrap().write_all(format!("clone success {}",pid).as_bytes()).unwrap();
+                    }
+                    Err(e) => {
+                        GLOBAL_STREAM.get().unwrap().write_all(format!("error: {}", e).as_bytes()).unwrap();
+                    }
+                }
+                unsafe { kill(process::id() as pid_t, SIGSTOP ) }
+            });
+        },
+        Some("jhook") => {
+            std::thread::spawn(|| {
+                match jhook() {
+                    Ok(_) => {},
+                    Err(e) => {
+                        GLOBAL_STREAM.get().unwrap().write_all(format!("{}", e).as_bytes()).unwrap();
+                    }
+                }
+            });
+        },
+        Some("stalker") => {
+            let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            follow(tid)
+        },
+        Some("hfl") => {
+            let mut cmds = command.split_whitespace();
+            let md = cmds.nth(1).unwrap();
+            let offset = cmds.next().and_then(|s| {
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                usize::from_str_radix(s, 16).ok()
+            }).unwrap_or(0);
+            // log_msg(format!("hfl {}{}",md,offset).as_str());
+            hfollow(md,offset)
+        }
+        _ => {
+            GLOBAL_STREAM.get().unwrap().write_all(format!("无效命令: {}", command).as_bytes()).unwrap();
         }
     }
 }

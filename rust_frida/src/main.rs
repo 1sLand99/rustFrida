@@ -100,6 +100,7 @@ macro_rules! define_dl_functions {
 }
 
 // 定义字符串表宏
+// 支持通过 overrides HashMap 覆盖默认值，格式：name=value
 macro_rules! define_string_table {
     ($(($name:ident, $value:expr)),* $(,)?) => {
         paste! {
@@ -111,11 +112,20 @@ macro_rules! define_string_table {
                 )*
             }
 
+            // 获取所有可用的字符串名称
+            fn get_string_table_names() -> Vec<&'static str> {
+                vec![$(stringify!($name)),*]
+            }
+
             #[allow(unused_assignments)]
-            fn write_string_table(pid: i32, malloc_addr: usize) -> Result<usize, String> {
+            fn write_string_table(pid: i32, malloc_addr: usize, overrides: &std::collections::HashMap<String, String>) -> Result<usize, String> {
                 $(
-                    // 添加 \0 结尾的字符串
-                    let mut $name = $value.to_vec();
+                    // 检查是否有覆盖值
+                    let mut $name = if let Some(override_val) = overrides.get(stringify!($name)) {
+                        override_val.as_bytes().to_vec()
+                    } else {
+                        $value.to_vec() 
+                    };
                     $name.push(0); // 添加 NULL 结尾
                 )*
 
@@ -124,7 +134,7 @@ macro_rules! define_string_table {
                 let total_size = table_size + strings_len;
 
                 // 通过 call_target_function 用目标进程的 malloc 分配内存
-                let table_addr = call_target_function(pid, malloc_addr, &[total_size],None)?;
+                let table_addr = call_target_function(pid, malloc_addr, &[total_size], None)?;
                 let mut string_addr = table_addr + table_size;
 
                 let mut table = StringTable {
@@ -157,6 +167,7 @@ define_string_table!(
     (pthread_err, b"pthreadded"),
     (dlsym_err, b"dlsymFail"),
     (proc_path, b"/proc/self/fd/"),
+    (cmdline, b"novalue"),
     // 未来添加字符串只需在这里添加新行即可
 );
 
@@ -426,6 +437,11 @@ struct Args {
     /// 监听超时时间（秒），默认无限等待
     #[arg(short = 't', long = "timeout")]
     timeout: Option<u64>,
+
+    /// 添加自定义字符串到字符串表（可多次使用）
+    /// 格式: name=value 或直接指定值
+    #[arg(short = 's', long = "string", value_name = "NAME=VALUE")]
+    strings: Vec<String>,
 }
 
 fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, String> {
@@ -475,7 +491,7 @@ fn handle_socket_connection(mut stream: UnixStream) {
         }
         
         if let Ok(msg) = String::from_utf8(buffer[..size].to_vec()) {
-            print!("{}", msg);
+            println!("{}", msg);
             
             // 如果是 HELLO_LOADER，额外发送 memfd
             if msg.trim() == "HELLO_LOADER" {
@@ -638,7 +654,7 @@ fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), String> {
 }
 
 /// 注入 agent 到目标进程
-fn inject_to_process(pid: i32) -> Result<(), String> {
+fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
     println!("正在附加到进程 PID: {}", pid);
 
     // 获取自身和目标进程的 libc 基址
@@ -710,7 +726,7 @@ fn inject_to_process(pid: i32) -> Result<(), String> {
     println!("DlOffsets写入成功，地址: 0x{:x}", dloffset_addr);
 
     // 写入字符串表
-    let string_table_addr = write_string_table(pid, offsets.malloc)?;
+    let string_table_addr = write_string_table(pid, offsets.malloc, string_overrides)?;
     println!("字符串表写入成功，地址: 0x{:x}", string_table_addr);
 
     // 使用 call_target_function 调用 shellcode
@@ -749,7 +765,7 @@ fn inject_to_process(pid: i32) -> Result<(), String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
-fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>) -> Result<(), String> {
+fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
     use ldmonitor::DlopenMonitor;
     use std::time::Duration;
 
@@ -766,10 +782,13 @@ fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>) -> Result<(), S
         monitor.wait_for_path(so_pattern)
     };
 
+    // 停止并卸载 eBPF 程序
+    monitor.stop();
+
     match info {
         Some(dlopen_info) => {
             println!("检测到 SO 加载: pid={}, path={}", dlopen_info.pid, dlopen_info.path);
-            inject_to_process(dlopen_info.pid as i32)
+            inject_to_process(dlopen_info.pid as i32, string_overrides)
         }
         None => Err("监听超时，未检测到匹配的 SO 加载".to_string())
     }
@@ -793,17 +812,41 @@ fn main() {
     // 启动抽象套接字监听
     let handle = start_socket_listener("rust_frida_socket");
 
+    // 解析字符串覆盖参数（格式：name=value）
+    let mut string_overrides = std::collections::HashMap::new();
+    let available_names = get_string_table_names();
+
+    for s in &args.strings {
+        if let Some((name, value)) = s.split_once('=') {
+            if available_names.contains(&name) {
+                string_overrides.insert(name.to_string(), value.to_string());
+            } else {
+                eprintln!("警告: 未知的字符串名称 '{}', 可用名称: {:?}", name, available_names);
+            }
+        } else {
+            eprintln!("警告: 无效的字符串格式 '{}', 应为 name=value", s);
+        }
+    }
+
+    // 打印字符串覆盖信息
+    if !string_overrides.is_empty() {
+        println!("字符串覆盖列表 ({} 个):", string_overrides.len());
+        for (name, value) in &string_overrides {
+            println!("  {} = {}", name, value);
+        }
+    }
+
     // 根据参数选择注入方式
     let result = if let Some(so_pattern) = &args.watch_so {
         // 使用 eBPF 监听 SO 加载
-        watch_and_inject(so_pattern, args.timeout)
+        watch_and_inject(so_pattern, args.timeout, &string_overrides)
     } else if let Some(pid) = args.pid {
         // 直接附加到指定 PID
         if pid <= 0 {
             eprintln!("错误: PID必须是正整数");
             process::exit(1);
         }
-        inject_to_process(pid)
+        inject_to_process(pid, &string_overrides)
     } else {
         eprintln!("错误: 必须指定 --pid 或 --watch-so");
         process::exit(1);
@@ -814,23 +857,21 @@ fn main() {
         process::exit(1);
     }
 
-    loop {
-        unsafe {
-            while *(AGENT_STAT.read().unwrap()) == false {
-                eprintln!("等待Agent回连");
-                sleep(1);
-            }
+    unsafe {
+        while *(AGENT_STAT.read().unwrap()) == false {
+            sleep(1);
+            println!("agent {}", AGENT_STAT.read().unwrap());
         }
-        let sender = GLOBAL_SENDER.get().unwrap();
+    }
+    let sender = GLOBAL_SENDER.get().unwrap();
+
+    loop {
         let mut line = String::new();
         io::stdin()
             .read_line(&mut line)
             .expect("读取失败");
 
         let line = line.trim().to_string();
-        if line.is_empty() {
-            break;
-        }
 
         match sender.send(line) {
             Ok(_) => {},

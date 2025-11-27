@@ -10,8 +10,8 @@ use frida_gum as gum;
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
 use lazy_static::lazy_static;
 use crossbeam_channel::{bounded, Sender};
-use frida_gum::{Module, NativePointer, Process};
-use crate::GLOBAL_STREAM;
+use frida_gum::{Module, ModuleMap, NativePointer, Process};
+use crate::{log_msg, GLOBAL_STREAM};
 use prost::Message;
 use frida_gum::interceptor::{Interceptor, InvocationContext, InvocationListener};
 
@@ -435,24 +435,42 @@ struct OpenListener;
 
 impl InvocationListener for OpenListener {
     fn on_enter(&mut self, _context: InvocationContext) {
-        GLOBAL_STREAM.get().unwrap().write_all(format!("begin trace {}",_context.thread_id()).as_bytes());
-        follow(_context.thread_id() as usize);
+        log_msg(format!("oopps trace {}",_context.thread_id()).as_str())
+        // follow(_context.thread_id() as usize);
     }
 
     fn on_leave(&mut self, _context: InvocationContext) {
-        GLOBAL_STREAM.get().unwrap().write_all("end trace".as_bytes());
-        Stalker::new(&GUM).unfollow(_context.thread_id() as usize);
+        // GLOBAL_STREAM.get().unwrap().write_all("end trace".as_bytes());
+        // Stalker::new(&GUM).unfollow(_context.thread_id() as usize);
     }
 }
 
-pub fn hfollow(lib:String,addr:usize) {
-    let proc = Process::obtain(&GUM);
-    let md = proc.find_module_by_name(lib.as_str()).unwrap();
-    let target = md.range().base_address().0 as u64 + addr as u64;
+/// 从 /proc/self/maps 查找库的基址
+fn find_lib_base(lib_name: &str) -> Option<usize> {
+    use std::io::BufRead;
+    let file = File::open("/proc/self/maps").ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line.ok()?;
+        // 检查该行是否包含目标库名
+        if line.contains(lib_name) {
+            // 格式: 7f1234560000-7f1234570000 r-xp 00000000 08:01 12345 /path/to/lib.so
+            let addr_part = line.split('-').next()?;
+            let base = usize::from_str_radix(addr_part, 16).ok()?;
+            return Some(base);
+        }
+    }
+    None
+}
+
+pub fn hfollow(lib:&str,addr:usize) {
+    let base = find_lib_base(lib).expect(&format!("Failed to find {} in /proc/self/maps", lib));
+    let target = base + addr;
     let mut listener = OpenListener {};
     let mut interceptor = Interceptor::obtain(&GUM);
+    log_msg(format!("begin trace {:x}",target).as_str());
     interceptor.attach(NativePointer(target as *mut c_void),&mut listener).unwrap();
-
 }
 
 
