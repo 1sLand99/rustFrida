@@ -500,7 +500,7 @@ static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
 static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// 日志函数：socket未连接时缓存，已连接时直接发送
-fn log_msg(msg: &str) {
+fn log_msg(msg: String ){
     match GLOBAL_STREAM.get() {
         Some(mut stream) => {
             let _ = stream.write_all(msg.as_bytes());

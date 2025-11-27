@@ -65,16 +65,27 @@ struct MemoryRegion {
     data: Vec<u8>,
 }
 
-// 内存快照
+// 内存快照头部信息（用于流式写入）
 #[derive(Clone, PartialEq, Message)]
-struct MemorySnapshot {
+struct SnapshotHeader {
     #[prost(uint64, tag = "1")]
     timestamp: u64,
     #[prost(uint32, tag = "2")]
     pid: u32,
-    #[prost(message, repeated, tag = "3")]
-    regions: Vec<MemoryRegion>,
+    #[prost(uint32, tag = "3")]
+    region_count: u32,  // 区域总数（可选，用于读取时预分配）
 }
+
+// 内存快照（完整版，保留用于可能的非流式场景）
+// #[derive(Clone, PartialEq, Message)]
+// struct MemorySnapshot {
+//     #[prost(uint64, tag = "1")]
+//     timestamp: u64,
+//     #[prost(uint32, tag = "2")]
+//     pid: u32,
+//     #[prost(message, repeated, tag = "3")]
+//     regions: Vec<MemoryRegion>,
+// }
 
 
 lazy_static! {
@@ -129,13 +140,13 @@ lazy_static! {
                 // 使用 protobuf 的 length-delimited 编码（变长编码）
                 let mut buf = Vec::new();
                 if let Err(e) = msg.encode_length_delimited(&mut buf) {
-                    eprintln!("Protobuf 编码失败: {}", e);
+                    log_msg(format!("Protobuf 编码失败: {}", e));
                     continue;
                 }
 
                 // 写入日志文件（protobuf 自带长度前缀）
                 if let Err(e) = log_file.write_all(&buf) {
-                    eprintln!("写入 protobuf 数据失败: {}", e);
+                    log_msg(format!("写入 protobuf 数据失败: {}", e));
                     continue;
                 }
 
@@ -207,15 +218,17 @@ fn read_memory_region(mem_file: &mut File, start_addr: u64, size: usize) -> std:
     Ok(buffer)
 }
 
-// Dump 内存快照到文件
+// Dump 内存快照到文件（流式写入版本）
 fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
     // 读取 /proc/self/maps
     let maps_content = std::fs::read_to_string("/proc/self/maps")?;
 
-    // 打开 /proc/self/mem
-    let mut mem_file = File::open("/proc/self/mem")?;
-
-    let mut regions = Vec::new();
+    // 打开输出文件
+    let mut output_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(output_path)?;
 
     // 获取当前时间戳
     let timestamp = std::time::SystemTime::now()
@@ -226,7 +239,30 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
     // 获取当前进程 PID
     let pid = std::process::id();
 
-    // 解析每一行
+    // 预先统计可读区域数量
+    let region_count = maps_content
+        .lines()
+        .filter_map(parse_maps_line)
+        .filter(|(_, _, permissions, _, _, _, _)| permissions.starts_with('r'))
+        .count() as u32;
+
+    // 1. 先写入头部信息
+    let header = SnapshotHeader {
+        timestamp,
+        pid,
+        region_count,
+    };
+    let mut header_buf = Vec::new();
+    header.encode_length_delimited(&mut header_buf).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e))
+    })?;
+    output_file.write_all(&header_buf)?;
+    // 打开 /proc/self/mem
+    let mut mem_file = File::open("/proc/self/mem")?;
+    log_msg("3".to_string());
+
+    // 2. 流式处理每个内存区域
+    let mut processed_count = 0u32;
     for line in maps_content.lines() {
         if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) = parse_maps_line(line) {
             // 只 dump 可读的内存区域
@@ -240,12 +276,13 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
             let data = match read_memory_region(&mut mem_file, start_addr, size) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("无法读取内存区域 0x{:x}-0x{:x}: {}", start_addr, end_addr, e);
+                    log_msg(format!("无法读取内存区域 0x{:x}-0x{:x}: {}", start_addr, end_addr, e));
                     Vec::new() // 失败时使用空数据
                 }
             };
 
-            regions.push(MemoryRegion {
+            // 创建单个区域消息
+            let region = MemoryRegion {
                 start_addr,
                 end_addr,
                 permissions,
@@ -254,31 +291,23 @@ fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
                 inode,
                 pathname,
                 data,
-            });
+            };
+
+            // 编码并立即写入（使用 length-delimited 格式）
+            let mut region_buf = Vec::new();
+            region.encode_length_delimited(&mut region_buf).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("Region 编码失败: {}", e))
+            })?;
+            output_file.write_all(&region_buf)?;
+
+            processed_count += 1;
+
+            // region 和 region_buf 在这里被丢弃，释放内存
         }
     }
 
-    // 创建内存快照
-    let snapshot = MemorySnapshot {
-        timestamp,
-        pid,
-        regions,
-    };
-
-    // 编码为 protobuf
-    let mut buf = Vec::new();
-    snapshot.encode(&mut buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("Protobuf 编码失败: {}", e))
-    })?;
-
-    // 写入文件
-    let mut output_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(output_path)?;
-
-    output_file.write_all(&buf)?;
+    // 刷新缓冲区确保数据写入磁盘
+    output_file.flush()?;
 
     Ok(())
 }
@@ -312,24 +341,17 @@ pub fn follow(tid:usize) {
     let snapshot_path = "/data/data/com.zhenxi.hunter/files/memory_snapshot.pb";
     match dump_memory_snapshot(snapshot_path) {
         Ok(_) => {
-            unsafe {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(format!("内存快照已保存到: {}\n", snapshot_path).as_bytes());
-                }
-            }
+            log_msg(format!("内存快照已保存到: {}\n", snapshot_path))
         }
         Err(e) => {
-            unsafe {
-                if let Some(mut stream) = GLOBAL_STREAM.get() {
-                    let _ = stream.write_all(format!("内存快照保存失败: {}\n", e).as_bytes());
-                }
-            }
+            log_msg(format!("内存快照保存失败: {}\n", e))
         }
     }
 
     let mut stalker = Stalker::new(&GUM);
 
-    let mut proc = Process::obtain(&GUM);
+    let mut mdmap = ModuleMap::default();
+    mdmap.update();
 
     // 存储模块信息：base -> (size, path, name)
     // let mut modules: BTreeMap<usize, (usize, String, String)> = BTreeMap::new();
@@ -390,7 +412,7 @@ pub fn follow(tid:usize) {
             let bytes = instr_bytes[0..4].to_vec();
 
             // 获取模块信息
-            let (md_path, md_name) = match proc.find_module_by_address(addr as usize) {
+            let (md_path, md_name) = match mdmap.find(addr) {
                 Some(m) => {
                     (m.path().to_string(), format!("{}+0x{:x}", m.name(), addr - m.range().base_address().0 as u64))
                 },
@@ -435,7 +457,7 @@ struct OpenListener;
 
 impl InvocationListener for OpenListener {
     fn on_enter(&mut self, _context: InvocationContext) {
-        log_msg(format!("oopps trace {}",_context.thread_id()).as_str())
+        log_msg(format!("oopps trace {}",_context.thread_id()))
         // follow(_context.thread_id() as usize);
     }
 
@@ -469,7 +491,7 @@ pub fn hfollow(lib:&str,addr:usize) {
     let target = base + addr;
     let mut listener = OpenListener {};
     let mut interceptor = Interceptor::obtain(&GUM);
-    log_msg(format!("begin trace {:x}",target).as_str());
+    // log_msg(format!("begin trace {:x}",target));
     interceptor.attach(NativePointer(target as *mut c_void),&mut listener).unwrap();
 }
 
