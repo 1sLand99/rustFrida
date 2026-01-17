@@ -1,10 +1,15 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
+
 mod jhook;
 mod gumlibc;
 mod writer;
 mod relocater;
-mod stalker;
 mod trace;
+
+#[cfg(feature = "frida-gum")]
+mod stalker;
+#[cfg(feature = "qbdi")]
+mod qbdi_trace;
 
 use crate::jhook::jhook;
 use libc::{c_char, c_int, close, kill, mmap, munmap, pid_t, sockaddr, sockaddr_un, sysconf, AF_UNIX, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, SIGSTOP, _SC_PAGESIZE, SIGTRAP};
@@ -20,13 +25,10 @@ use std::process;
 use std::ptr;
 use std::ptr::null_mut;
 use std::sync::{ Mutex, OnceLock};
-use std::thread::sleep_ms;
 use std::time::Duration;
-use frida_gum::{ModuleMap, DebugSymbol, NativePointer};
-// use nix::unistd::chflags;
-use stalker::follow;
-use crate::stalker::{hfollow};
-use crate::stalker::qfollow;
+
+#[cfg(feature = "frida-gum")]
+use frida_gum::ModuleMap;
 
 // 定义我们自己的Result类型，错误统一为String
 type Result<T> = std::result::Result<T, String>;
@@ -396,50 +398,40 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, _ucontext: 
 
         crash_msg.push_str("\n=== BACKTRACE ===\n");
 
-        // 解析内存映射
-        let mut mdmap = ModuleMap::new();
-        mdmap.update();
-
         // 使用 _Unwind_Backtrace 获取调用栈
         let frames = collect_backtrace();
 
-        for (idx, &addr) in frames.iter().enumerate() {
-            crash_msg.push_str(&format!("#{:<3} 0x{:016x}", idx, addr));
+        #[cfg(feature = "frida-gum")]
+        {
+            // 解析内存映射（需要 frida-gum）
+            let mut mdmap = ModuleMap::new();
+            mdmap.update();
 
-            if let Some(map) =  mdmap.find(addr as u64){
-                let offset = addr - map.range().base_address().0 as usize;
+            for (idx, &addr) in frames.iter().enumerate() {
+                crash_msg.push_str(&format!("#{:<3} 0x{:016x}", idx, addr));
 
-                let mdname = map.name();
-                if is_memfd(&mdname) {
-                    // memfd 中的代码（agent），尝试解析符号
-                    crash_msg.push_str(&format!(" (memfd+0x{:x})", offset));
-
-                    // 使用 Frida DebugSymbol 解析符号
-                    // if let Some(symbol) = DebugSymbol::from_address(NativePointer(addr as *mut c_void)) {
-                    //     if let Ok(name) = symbol.symbol_name() {
-                    //         if !name.is_empty() {
-                    //             crash_msg.push_str(&format!("\n      {}", name));
-                    //         }
-                    //     }
-                        // if let Ok(filename) = symbol.file_name() {
-                        //     if !filename.is_empty() {
-                        //         crash_msg.push_str(&format!("\n      at {}", filename));
-                        //         let line = symbol.line_number();
-                        //         if line > 0 {
-                        //             crash_msg.push_str(&format!(":{}", line));
-                        //         }
-                        //     }
-                        // }
-                    // }
+                if let Some(map) = mdmap.find(addr as u64) {
+                    let offset = addr - map.range().base_address().0 as usize;
+                    let mdname = map.name();
+                    if is_memfd(&mdname) {
+                        crash_msg.push_str(&format!(" (memfd+0x{:x})", offset));
+                    } else {
+                        let lib_name = mdname.rsplit('/').next().unwrap_or(mdname.as_str());
+                        crash_msg.push_str(&format!(" {} +0x{:x}", lib_name, offset));
+                    }
                 } else {
-                    // 其他 SO 库，只打印库名和偏移
-                    let lib_name = mdname.rsplit('/').next().unwrap_or(mdname.as_str());
-                    crash_msg.push_str(&format!(" {} +0x{:x}", lib_name, offset));
+                    crash_msg.push_str(" <unknown mapping>");
                 }
-            } else {
-                crash_msg.push_str(" <unknown mapping>");
+                crash_msg.push('\n');
             }
-            crash_msg.push('\n');
+        }
+
+        #[cfg(not(feature = "frida-gum"))]
+        {
+            // 无 frida-gum 时只打印地址
+            for (idx, &addr) in frames.iter().enumerate() {
+                crash_msg.push_str(&format!("#{:<3} 0x{:016x}\n", idx, addr));
+            }
         }
 
         crash_msg.push_str("=== END BACKTRACE ===\n\n");
@@ -503,7 +495,7 @@ fn flush_cached_logs() {
 #[no_mangle]
 pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
     // 首先安装崩溃信号处理器
-    // install_crash_handlers();
+    install_crash_handlers();
 
     unsafe {
         // 解析 StringTable 结构
@@ -571,13 +563,13 @@ fn process_cmd(command: &str) {
             std::thread::spawn(move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
-                        GLOBAL_STREAM.get().unwrap().write_all(format!("clone success {}",pid).as_bytes()).unwrap();
+                        let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("clone success {}", pid).as_bytes());
                     }
                     Err(e) => {
-                        GLOBAL_STREAM.get().unwrap().write_all(format!("error: {}", e).as_bytes()).unwrap();
+                        let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("error: {}", e).as_bytes());
                     }
                 }
-                unsafe { kill(process::id() as pid_t, SIGSTOP ) }
+                unsafe { kill(process::id() as pid_t, SIGSTOP) }
             });
         },
         Some("jhook") => {
@@ -585,15 +577,17 @@ fn process_cmd(command: &str) {
                 match jhook() {
                     Ok(_) => {},
                     Err(e) => {
-                        GLOBAL_STREAM.get().unwrap().write_all(format!("{}", e).as_bytes()).unwrap();
+                        let _ = GLOBAL_STREAM.get().unwrap().write_all(format!("{}", e).as_bytes());
                     }
                 }
             });
         },
+        #[cfg(feature = "frida-gum")]
         Some("stalker") => {
             let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-            follow(tid)
+            stalker::follow(tid)
         },
+        #[cfg(feature = "frida-gum")]
         Some("hfl") => {
             let mut cmds = command.split_whitespace();
             let md = cmds.nth(1).unwrap();
@@ -601,9 +595,9 @@ fn process_cmd(command: &str) {
                 let s = s.strip_prefix("0x").unwrap_or(s);
                 usize::from_str_radix(s, 16).ok()
             }).unwrap_or(0);
-            // log_msg(format!("hfl {}{}",md,offset).as_str());
-            hfollow(md,offset)
+            stalker::hfollow(md, offset)
         },
+        #[cfg(feature = "qbdi")]
         Some("qfl") => {
             let mut cmds = command.split_whitespace();
             let md = cmds.nth(1).unwrap();
@@ -611,9 +605,8 @@ fn process_cmd(command: &str) {
                 let s = s.strip_prefix("0x").unwrap_or(s);
                 usize::from_str_radix(s, 16).ok()
             }).unwrap_or(0);
-            // log_msg(format!("qfl {} {}",md,offset));
-            qfollow(md,offset)
-        }
+            qbdi_trace::qfollow(md, offset)
+        },
         _ => {
             log_msg("无效命令".to_string())
         }

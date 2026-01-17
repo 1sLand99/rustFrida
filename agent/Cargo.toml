@@ -4,13 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Frida agent for ARM64 Android"
 
+[features]
+default = ["frida-gum", "qbdi"]
+frida-gum = ["dep:frida-gum"]
+qbdi = ["dep:qbdi"]
+
 [dependencies]
 frida-gum = { path = "../frida-gum", features = [
     "event-sink",
     "invocation-listener",
     "std"
-]}
-qbdi = { path = "../qbdi" }
+], optional = true }
+qbdi = { path = "../qbdi", optional = true }
 libc = "1.0.0-alpha.1"
 jni = "0.21.1"
 once_cell = "1.21.3"
