@@ -1,5 +1,7 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
+mod logger;
+
 use clap::Parser;
 use libc::{bind, listen, sleep, sockaddr_un, AF_UNIX, SOCK_STREAM};
 use libc::{c_int, c_void, close, connect, free, iovec, malloc, mmap, mprotect, munmap, pid_t, pthread_create, pthread_detach, recvmsg, socket, write, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SETREGSET};
@@ -58,8 +60,8 @@ macro_rules! define_libc_functions {
             }
 
             fn print_offsets(&self) {
-                println!("目标进程函数地址列表:");
-                $(println!("  {}: 0x{:x}", stringify!($name), self.$name);)*
+                log_step!("目标进程函数地址列表:");
+                $(println!("     {}: 0x{:x}", stringify!($name), self.$name);)*
             }
         }
     };
@@ -92,8 +94,8 @@ macro_rules! define_dl_functions {
             }
 
             fn print_offsets(&self) {
-                println!("libdl.so 函数地址列表:");
-                $(println!("  {}: 0x{:x}", stringify!($name), self.$name);)*
+                log_step!("libdl.so 函数地址列表:");
+                $(println!("     {}: 0x{:x}", stringify!($name), self.$name);)*
             }
         }
     };
@@ -283,10 +285,10 @@ fn attach_to_process(pid: i32) -> Result<(), String> {
     // 尝试附加到目标进程
     match ptrace::attach(target_pid) {
         Ok(_) => {
-            println!("成功附加到进程 {}，等待 SIGSTOP...", pid);
+            log_success!("成功附加到进程 {}，等待 SIGSTOP...", pid);
             match waitpid(target_pid, None) {
                 Ok(WaitStatus::Stopped(_, _)) => {
-                    println!("进程已停止，可以操作寄存器");
+                    log_success!("进程已停止，可以操作寄存器");
                     Ok(())
                 }
                 other => Err(format!("waitpid 状态异常: {:?}", other)),
@@ -496,19 +498,21 @@ fn handle_socket_connection(mut stream: UnixStream) {
         }
         
         if let Ok(msg) = String::from_utf8(buffer[..size].to_vec()) {
-            println!("{}", msg);
-            
+            let trimmed = msg.trim();
+
             // 如果是 HELLO_LOADER，额外发送 memfd
-            if msg.trim() == "HELLO_LOADER" {
+            if trimmed == "HELLO_LOADER" {
+                log_info!("{}", trimmed);
                 let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
                 if memfd >= 0 {
                     if let Err(e) = send_fd_over_unix_socket(&stream, memfd) {
-                        eprintln!("发送 memfd 失败: {}", e);
+                        log_error!("发送 memfd 失败: {}", e);
                     }
                 } else {
-                    eprintln!("memfd 无效，无法发送 agent.so");
+                    log_error!("memfd 无效，无法发送 agent.so");
                 }
-            }else if msg.trim() == "HELLO_AGENT" {
+            } else if trimmed == "HELLO_AGENT" {
+                log_success!("Agent 已连接");
                 let mut stream_clone = stream.try_clone().unwrap();
                 thread::spawn(move || {
                     let (sd,rx) = channel();
@@ -518,12 +522,14 @@ fn handle_socket_connection(mut stream: UnixStream) {
                         match stream_clone.write_all(msg.as_bytes()){
                             Ok(_) => {},
                             Err(e) => {
-                                eprintln!("<UNK> stream <UNK>: {}", e);
+                                log_error!("stream 写入失败: {}", e);
                                 break;
                             }
                         }
                     }
                 });
+            } else {
+                log_agent!("{}", trimmed);
             }
         }
     }
@@ -573,7 +579,7 @@ fn start_socket_listener(socket_path: &str) -> Result<JoinHandle<()>, Box<dyn st
                         handle_socket_connection(stream);
                     });
                 }
-                Err(e) => eprintln!("接受连接失败: {}", e),
+                Err(e) => log_error!("接受连接失败: {}", e),
             }
         }
     });
@@ -660,7 +666,7 @@ fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), String> {
 
 /// 注入 agent 到目标进程
 fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<String, String>) -> Result<(), String> {
-    println!("正在附加到进程 PID: {}", pid);
+    log_info!("正在附加到进程 PID: {}", pid);
 
     // 获取自身和目标进程的 libc 基址
     let self_base = get_libc_base(None)?;
@@ -668,10 +674,10 @@ fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<Stri
     let self_dl_base = get_dl_base(None)?;
     let target_dl_base = get_dl_base(Some(pid))?;
 
-    println!("自身 libc.so 基址: 0x{:x}", self_base);
-    println!("目标进程 libc.so 基址: 0x{:x}", target_base);
-    println!("自身 libdl.so 基址: 0x{:x}", self_dl_base);
-    println!("目标进程 libdl.so 基址: 0x{:x}", target_dl_base);
+    log_step!("自身 libc.so 基址: 0x{:x}", self_base);
+    log_step!("目标进程 libc.so 基址: 0x{:x}", target_base);
+    log_step!("自身 libdl.so 基址: 0x{:x}", self_dl_base);
+    log_step!("目标进程 libdl.so 基址: 0x{:x}", target_dl_base);
 
     // 计算目标进程中的函数地址
     let offsets = LibcOffsets::calculate(self_base, target_base);
@@ -683,7 +689,7 @@ fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<Stri
 
     // 附加到目标进程
     attach_to_process(pid)?;
-    println!("附加成功，开始分配内存");
+    log_info!("开始分配内存");
 
     // 分配内存用于shellcode
     let page_size = 4096;
@@ -703,65 +709,72 @@ fn inject_to_process(pid: i32, string_overrides: &std::collections::HashMap<Stri
         ], None
     ).map_err(|e| format!("调用 mmap 失败: {}", e))?;
 
-    println!("分配shellcode内存地址: 0x{:x}", shellcode_addr);
+    log_step!("分配shellcode内存");
+    log_addr!("地址", shellcode_addr);
 
     // 写入shellcode
     write_bytes(pid, shellcode_addr, SHELLCODE)?;
-    println!("Shellcode写入成功，地址: 0x{:x}", shellcode_addr);
+    log_success!("Shellcode写入成功");
+    log_addr!("地址", shellcode_addr);
 
     // 分配内存用于LibcOffsets结构体
     let offsets_size = size_of::<LibcOffsets>();
     let offsets_addr = call_target_function(pid, offsets.malloc, &[offsets_size], None)
         .map_err(|e| format!("分配offsets内存失败: {}", e))?;
 
-    println!("分配offsets内存地址: 0x{:x}", offsets_addr);
+    log_step!("分配offsets内存");
+    log_addr!("地址", offsets_addr);
 
     // 写入LibcOffsets结构体
     write_memory(pid, offsets_addr, &offsets)?;
-    println!("Offsets写入成功，地址: 0x{:x}", offsets_addr);
+    log_success!("Offsets写入成功");
+    log_addr!("地址", offsets_addr);
 
     let dloffset_size = size_of::<DlOffsets>();
     let dloffset_addr = call_target_function(pid, offsets.malloc, &[dloffset_size], None)
         .map_err(|e| format!("分配dloffsets内存失败: {}", e))?;
 
-    println!("分配dloffsets内存地址: 0x{:x}", dloffset_addr);
+    log_step!("分配dloffsets内存");
+    log_addr!("地址", dloffset_addr);
 
     // 写入DlOffsets结构体
     write_memory(pid, dloffset_addr, &dl_offsets)?;
-    println!("DlOffsets写入成功，地址: 0x{:x}", dloffset_addr);
+    log_success!("DlOffsets写入成功");
+    log_addr!("地址", dloffset_addr);
 
     // 写入字符串表
     let string_table_addr = write_string_table(pid, offsets.malloc, string_overrides)?;
-    println!("字符串表写入成功，地址: 0x{:x}", string_table_addr);
+    log_success!("字符串表写入成功");
+    log_addr!("地址", string_table_addr);
 
     // 使用 call_target_function 调用 shellcode
     match call_target_function(pid, shellcode_addr, &[offsets_addr, dloffset_addr, string_table_addr], None) {
         Ok(return_value) => {
-            println!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
+            log_success!("Shellcode 执行完成，返回值: 0x{:x}", return_value as isize);
 
             // 释放shellcode内存
-            println!("正在释放shellcode内存...");
+            log_info!("正在释放shellcode内存...");
             match call_target_function(
                 pid,
                 offsets.munmap,
                 &[shellcode_addr, shellcode_len],
                 None
             ) {
-                Ok(_) => println!("Shellcode内存释放成功"),
-                Err(e) => eprintln!("释放shellcode内存失败: {}", e),
+                Ok(_) => log_success!("Shellcode内存释放成功"),
+                Err(e) => log_error!("释放shellcode内存失败: {}", e),
             }
 
             // detach 目标进程
             if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
-                eprintln!("分离目标进程失败: {}", e);
+                log_error!("分离目标进程失败: {}", e);
             } else {
-                println!("已分离目标进程");
+                log_success!("已分离目标进程");
             }
             Ok(())
         },
         Err(e) => {
-            eprintln!("执行 shellcode 失败: {}", e);
-            println!("暂停目标进程，等待调试器附加...");
+            log_error!("执行 shellcode 失败: {}", e);
+            log_warn!("暂停目标进程，等待调试器附加...");
             // 发送 SIGSTOP 让目标进程暂停
             let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
             Err(e)
@@ -790,7 +803,7 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
             None
         }
         Err(e) => {
-            eprintln!("读取 /data/data 目录失败: {}", e);
+            log_error!("读取 /data/data 目录失败: {}", e);
             None
         }
     }
@@ -801,16 +814,16 @@ fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_override
     use ldmonitor::DlopenMonitor;
     use std::time::Duration;
 
-    println!("正在启动 eBPF 监听器，等待加载: {}", so_pattern);
+    log_info!("正在启动 eBPF 监听器，等待加载: {}", so_pattern);
 
     let monitor = DlopenMonitor::new(None)
         .map_err(|e| format!("启动 eBPF 监听失败: {}", e))?;
 
     let info = if let Some(secs) = timeout_secs {
-        println!("超时时间: {} 秒", secs);
+        log_step!("超时时间: {} 秒", secs);
         monitor.wait_for_path_timeout(so_pattern, Duration::from_secs(secs))
     } else {
-        println!("无超时限制，持续监听中...");
+        log_step!("无超时限制，持续监听中...");
         monitor.wait_for_path(so_pattern)
     };
 
@@ -821,13 +834,13 @@ fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_override
             let pid = dlopen_info.pid();
             if let Some(ns_pid) = dlopen_info.ns_pid {
                 if ns_pid != dlopen_info.host_pid {
-                    println!("检测到 SO 加载: pid={} (host_pid={}), uid={}, path={}",
+                    log_success!("检测到 SO 加载: pid={} (host_pid={}), uid={}, path={}",
                         ns_pid, dlopen_info.host_pid, dlopen_info.uid, dlopen_info.path);
                 } else {
-                    println!("检测到 SO 加载: pid={}, uid={}, path={}", pid, dlopen_info.uid, dlopen_info.path);
+                    log_success!("检测到 SO 加载: pid={}, uid={}, path={}", pid, dlopen_info.uid, dlopen_info.path);
                 }
             } else {
-                println!("检测到 SO 加载: host_pid={}, uid={}, path={}", dlopen_info.host_pid, dlopen_info.uid, dlopen_info.path);
+                log_success!("检测到 SO 加载: host_pid={}, uid={}, path={}", dlopen_info.host_pid, dlopen_info.uid, dlopen_info.path);
             }
 
             // 克隆 string_overrides 以便修改
@@ -835,10 +848,10 @@ fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_override
 
             // 根据 uid 自动检测 /data/data/ 目录
             if let Some(data_dir) = find_data_dir_by_uid(dlopen_info.uid) {
-                println!("自动检测到应用数据目录: {}", data_dir);
+                log_step!("自动检测到应用数据目录: {}", data_dir);
                 overrides.insert("output_path".to_string(), data_dir);
             } else {
-                println!("警告: 未能找到 uid {} 对应的 /data/data/ 目录", dlopen_info.uid);
+                log_warn!("未能找到 uid {} 对应的 /data/data/ 目录", dlopen_info.uid);
             }
 
             inject_to_process(pid as i32, &overrides)
@@ -848,16 +861,17 @@ fn watch_and_inject(so_pattern: &str, timeout_secs: Option<u64>, string_override
 }
 
 fn main() {
+    logger::print_banner();
     let args = Args::parse();
 
     // 初始化 agent.so 的 memfd
     match create_memfd_with_data("wwb_so", AGENT_SO) {
         Ok(fd) => {
             AGENT_MEMFD.store(fd, Ordering::SeqCst);
-            println!("已创建 agent.so memfd: {}", fd);
+            log_success!("已创建 agent.so memfd: {}", fd);
         }
         Err(e) => {
-            eprintln!("创建 agent.so memfd 失败: {}", e);
+            log_error!("创建 agent.so memfd 失败: {}", e);
             process::exit(1);
         }
     }
@@ -874,18 +888,18 @@ fn main() {
             if available_names.contains(&name) {
                 string_overrides.insert(name.to_string(), value.to_string());
             } else {
-                eprintln!("警告: 未知的字符串名称 '{}', 可用名称: {:?}", name, available_names);
+                log_warn!("未知的字符串名称 '{}', 可用名称: {:?}", name, available_names);
             }
         } else {
-            eprintln!("警告: 无效的字符串格式 '{}', 应为 name=value", s);
+            log_warn!("无效的字符串格式 '{}', 应为 name=value", s);
         }
     }
 
     // 打印字符串覆盖信息
     if !string_overrides.is_empty() {
-        println!("字符串覆盖列表 ({} 个):", string_overrides.len());
+        log_info!("字符串覆盖列表 ({} 个):", string_overrides.len());
         for (name, value) in &string_overrides {
-            println!("  {} = {}", name, value);
+            println!("     {} = {}", name, value);
         }
     }
 
@@ -896,24 +910,24 @@ fn main() {
     } else if let Some(pid) = args.pid {
         // 直接附加到指定 PID
         if pid <= 0 {
-            eprintln!("错误: PID必须是正整数");
+            log_error!("PID必须是正整数");
             process::exit(1);
         }
         inject_to_process(pid, &string_overrides)
     } else {
-        eprintln!("错误: 必须指定 --pid 或 --watch-so");
+        log_error!("必须指定 --pid 或 --watch-so");
         process::exit(1);
     };
 
     if let Err(e) = result {
-        eprintln!("注入失败: {}", e);
+        log_error!("注入失败: {}", e);
         process::exit(1);
     }
 
     unsafe {
         while *(AGENT_STAT.read().unwrap()) == false {
             sleep(1);
-            println!("agent {}", AGENT_STAT.read().unwrap());
+            log_info!("等待 agent 连接...");
         }
     }
     let sender = GLOBAL_SENDER.get().unwrap();
@@ -922,21 +936,21 @@ fn main() {
     if let Some(script_path) = &args.load_script {
         match std::fs::read_to_string(script_path) {
             Ok(script) => {
-                println!("Loading script from: {}", script_path);
+                log_info!("加载脚本: {}", script_path);
                 // First initialize the JS engine
                 if let Err(e) = sender.send("jsinit".to_string()) {
-                    eprintln!("Failed to send jsinit: {}", e);
+                    log_error!("发送 jsinit 失败: {}", e);
                 }
                 // Wait a bit for initialization
                 unsafe { sleep(1) };
                 // Send the script
                 let cmd = format!("loadjs {}", script);
                 if let Err(e) = sender.send(cmd) {
-                    eprintln!("Failed to send loadjs: {}", e);
+                    log_error!("发送 loadjs 失败: {}", e);
                 }
             }
             Err(e) => {
-                eprintln!("Failed to read script file '{}': {}", script_path, e);
+                log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
             }
         }
     }
@@ -952,7 +966,7 @@ fn main() {
         match sender.send(line) {
             Ok(_) => {},
             Err(e) => {
-                eprintln!("<UNK>: {}", e);
+                log_error!("发送命令失败: {}", e);
                 break;
             }
         }
@@ -964,6 +978,6 @@ fn main() {
     let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
     if memfd >= 0 {
         unsafe { close(memfd) };
-        println!("已关闭 agent.so memfd");
+        log_success!("已关闭 agent.so memfd");
     }
 }

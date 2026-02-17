@@ -584,15 +584,17 @@ fn install_panic_hook() {
 }
 
 /// 日志函数：socket未连接时缓存，已连接时直接发送
+/// 自动添加 [agent] 前缀
 fn log_msg(msg: String ){
+    let prefixed = format!("[agent] {}", msg);
     match GLOBAL_STREAM.get() {
         Some(mut stream) => {
-            let _ = stream.write_all(msg.as_bytes());
+            let _ = stream.write_all(prefixed.as_bytes());
         }
         None => {
             // Socket未连接，缓存日志
             if let Ok(mut cache) = CACHE_LOG.lock() {
-                cache.push(msg.to_string());
+                cache.push(prefixed);
             }
         }
     }

@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,9 @@ typedef struct HookEntry {
     uint8_t original_bytes[24];     /* Saved original bytes (up to 20 needed) */
     size_t original_size;           /* Number of bytes saved */
     int stealth;                    /* 1 if installed via wxshadow stealth mode */
+    void* thunk;                    /* Thunk code pointer (attach mode) */
+    size_t trampoline_alloc;        /* Trampoline allocated size */
+    size_t thunk_alloc;             /* Thunk allocated size */
     struct HookEntry* next;         /* Next entry in list */
 } HookEntry;
 
@@ -57,8 +61,10 @@ typedef struct {
     size_t exec_mem_size;           /* Total pool size */
     size_t exec_mem_used;           /* Used bytes */
     HookEntry* hooks;               /* Linked list of hooks */
+    HookEntry* free_list;           /* Freed entries for reuse */
+    pthread_mutex_t lock;           /* Thread safety lock */
+    size_t exec_mem_page_size;      /* Page size for mprotect */
     int initialized;                /* Initialization flag */
-    int stealth_mode;               /* 1 to use wxshadow for new hooks */
 } HookEngine;
 
 /*
@@ -75,9 +81,10 @@ int hook_engine_init(void* exec_mem, size_t size);
  *
  * @param target        Address to hook
  * @param replacement   Replacement function address
+ * @param stealth       1 to use wxshadow stealth mode, 0 for normal mode
  * @return              Pointer to trampoline (to call original), NULL on failure
  */
-void* hook_install(void* target, void* replacement);
+void* hook_install(void* target, void* replacement, int stealth);
 
 /*
  * Install a Frida-style hook with callbacks
@@ -86,9 +93,10 @@ void* hook_install(void* target, void* replacement);
  * @param on_enter      Callback called before the function (can be NULL)
  * @param on_leave      Callback called after the function (can be NULL)
  * @param user_data     User data passed to callbacks
+ * @param stealth       1 to use wxshadow stealth mode, 0 for normal mode
  * @return              0 on success, -1 on failure
  */
-int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data);
+int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data, int stealth);
 
 /*
  * Remove a hook
@@ -148,22 +156,6 @@ int hook_write_jump(void* dst, void* target);
  */
 void hook_flush_cache(void* start, size_t size);
 
-/*
- * Enable or disable wxshadow stealth mode
- *
- * When enabled, new hooks use prctl(PR_WXSHADOW_PATCH) to write jump
- * instructions via shadow pages, making the hook invisible to memory reads.
- *
- * @param enabled       1 to enable, 0 to disable
- */
-void hook_set_stealth(int enabled);
-
-/*
- * Get current stealth mode setting
- *
- * @return              1 if stealth mode is enabled, 0 otherwise
- */
-int hook_get_stealth(void);
 
 #ifdef __cplusplus
 }

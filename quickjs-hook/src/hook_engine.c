@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <unistd.h>
 
 /* wxshadow prctl operations - shadow page patching */
 #ifndef PR_WXSHADOW_PATCH
@@ -35,19 +36,61 @@ static HookEngine g_engine = {0};
 /* ARM64 instruction size */
 #define INSN_SIZE 4
 
+/* Default allocation sizes */
+#define TRAMPOLINE_ALLOC_SIZE 256
+#define THUNK_ALLOC_SIZE 512
+
+/* --- Pool permission management (Fix 2: RWX → R-X) --- */
+
+static int pool_make_writable(void) {
+    if (!g_engine.exec_mem) return -1;
+    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+                    PROT_READ | PROT_WRITE | PROT_EXEC);
+}
+
+static int pool_make_executable(void) {
+    if (!g_engine.exec_mem) return -1;
+    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
+                    PROT_READ | PROT_EXEC);
+}
+
+/* --- Entry free list management (Fix 4: memory reuse) --- */
+
+static HookEntry* alloc_entry(void) {
+    HookEntry* entry = NULL;
+
+    if (g_engine.free_list) {
+        /* Reuse from free list, preserving pool memory allocations */
+        entry = g_engine.free_list;
+        g_engine.free_list = entry->next;
+
+        void* saved_trampoline = entry->trampoline;
+        size_t saved_trampoline_alloc = entry->trampoline_alloc;
+        void* saved_thunk = entry->thunk;
+        size_t saved_thunk_alloc = entry->thunk_alloc;
+
+        memset(entry, 0, sizeof(HookEntry));
+
+        entry->trampoline = saved_trampoline;
+        entry->trampoline_alloc = saved_trampoline_alloc;
+        entry->thunk = saved_thunk;
+        entry->thunk_alloc = saved_thunk_alloc;
+    } else {
+        entry = (HookEntry*)hook_alloc(sizeof(HookEntry));
+        if (entry) memset(entry, 0, sizeof(HookEntry));
+    }
+
+    return entry;
+}
+
+static void free_entry(HookEntry* entry) {
+    entry->next = g_engine.free_list;
+    g_engine.free_list = entry;
+}
+
 /* Flush instruction cache */
 void hook_flush_cache(void* start, size_t size) {
     __builtin___clear_cache((char*)start, (char*)start + size);
-}
-
-/* Enable or disable wxshadow stealth mode */
-void hook_set_stealth(int enabled) {
-    g_engine.stealth_mode = enabled ? 1 : 0;
-}
-
-/* Get current stealth mode setting */
-int hook_get_stealth(void) {
-    return g_engine.stealth_mode;
 }
 
 /*
@@ -195,7 +238,13 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.exec_mem_size = size;
     g_engine.exec_mem_used = 0;
     g_engine.hooks = NULL;
+    g_engine.free_list = NULL;
+    g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
+    pthread_mutex_init(&g_engine.lock, NULL);
     g_engine.initialized = 1;
+
+    /* Tighten pool permissions: caller provides RWX, we keep R-X until needed */
+    pool_make_executable();
 
     return 0;
 }
@@ -211,33 +260,47 @@ static HookEntry* find_hook(void* target) {
 }
 
 /* Install a replacement hook */
-void* hook_install(void* target, void* replacement) {
+void* hook_install(void* target, void* replacement, int stealth) {
     if (!g_engine.initialized || !target || !replacement) {
         return NULL;
     }
 
+    pthread_mutex_lock(&g_engine.lock);
+
     /* Check if already hooked */
     if (find_hook(target)) {
+        pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
-    /* Allocate hook entry */
-    HookEntry* entry = (HookEntry*)hook_alloc(sizeof(HookEntry));
-    if (!entry) return NULL;
+    /* Make pool writable for allocation and code generation */
+    if (pool_make_writable() != 0) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
 
-    memset(entry, 0, sizeof(HookEntry));
+    /* Allocate hook entry (reuse from free list if possible) */
+    HookEntry* entry = alloc_entry();
+    if (!entry) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
     entry->target = target;
     entry->replacement = replacement;
 
-    /* Allocate trampoline space: relocated instructions + jump back
-     * Worst case: each original instruction may expand during relocation
-     * (e.g., B.cond -> B.!cond + 4*MOV + BR = 24 bytes)
-     * 5 instructions * 24 bytes + 20 bytes jump back = 140 bytes
-     * Use 256 for safety margin
-     */
-    size_t trampoline_size = 256;
-    entry->trampoline = hook_alloc(trampoline_size);
-    if (!entry->trampoline) return NULL;
+    /* Allocate trampoline space (reuse if available and large enough) */
+    if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
+        entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
+        entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
+    }
+    if (!entry->trampoline) {
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
 
     /* Save original bytes */
     memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
@@ -250,14 +313,22 @@ void* hook_install(void* target, void* replacement) {
     void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
     int jump_result = hook_write_jump((uint8_t*)entry->trampoline + relocated_size, jump_back_target);
     if (jump_result < 0) {
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
-    if (g_engine.stealth_mode) {
+    /* Tighten pool back to R-X before patching target */
+    pool_make_executable();
+
+    if (stealth) {
         /* Stealth mode: write jump to a temp buffer, then patch via wxshadow */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, replacement);
         if (jump_result < 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
         /* Pad remaining bytes with BRK */
@@ -265,6 +336,8 @@ void* hook_install(void* target, void* replacement) {
             *(uint32_t*)(jump_buf + i) = 0xD4200000 | (0xFFFF << 5); /* BRK #0xFFFF */
         }
         if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) != 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
         entry->stealth = 1;
@@ -272,10 +345,14 @@ void* hook_install(void* target, void* replacement) {
         /* Normal mode: mprotect + direct write */
         uintptr_t page_start = (uintptr_t)target & ~0xFFF;
         if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
         jump_result = hook_write_jump(target, replacement);
         if (jump_result < 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return NULL;
         }
         entry->stealth = 0;
@@ -283,25 +360,35 @@ void* hook_install(void* target, void* replacement) {
 
     /* Flush cache */
     hook_flush_cache(target, MIN_HOOK_SIZE);
-    hook_flush_cache(entry->trampoline, trampoline_size);
+    hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
 
     /* Add to list */
     entry->next = g_engine.hooks;
     g_engine.hooks = entry;
 
-    return entry->trampoline;
+    void* trampoline = entry->trampoline;
+    pthread_mutex_unlock(&g_engine.lock);
+    return trampoline;
 }
 
 /* Generate thunk code for attach hook using arm64_writer */
 static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
                                     HookCallback on_leave, void* user_data,
                                     size_t* thunk_size_out) {
-    size_t thunk_size = 512;
-    void* thunk_mem = hook_alloc(thunk_size);
-    if (!thunk_mem) return NULL;
+    void* thunk_mem;
+
+    /* Reuse thunk memory from free list entry if available and large enough */
+    if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
+        thunk_mem = entry->thunk;
+    } else {
+        thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+        if (!thunk_mem) return NULL;
+        entry->thunk = thunk_mem;
+        entry->thunk_alloc = THUNK_ALLOC_SIZE;
+    }
 
     Arm64Writer w;
-    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, thunk_size);
+    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
 
     /* Allocate stack space for HookContext (256 bytes) + saved LR (8 bytes) + alignment */
     /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) = 272 bytes */
@@ -382,7 +469,7 @@ static void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
 }
 
 /* Install a Frida-style hook with callbacks */
-int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data) {
+int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data, int stealth) {
     if (!g_engine.initialized) {
         return HOOK_ERROR_NOT_INITIALIZED;
     }
@@ -395,16 +482,28 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         return HOOK_ERROR_INVALID_PARAM; /* At least one callback required */
     }
 
+    pthread_mutex_lock(&g_engine.lock);
+
     /* Check if already hooked */
     if (find_hook(target)) {
+        pthread_mutex_unlock(&g_engine.lock);
         return HOOK_ERROR_ALREADY_HOOKED;
     }
 
-    /* Allocate hook entry */
-    HookEntry* entry = (HookEntry*)hook_alloc(sizeof(HookEntry));
-    if (!entry) return HOOK_ERROR_ALLOC_FAILED;
+    /* Make pool writable for allocation and code generation */
+    if (pool_make_writable() != 0) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return HOOK_ERROR_MPROTECT_FAILED;
+    }
 
-    memset(entry, 0, sizeof(HookEntry));
+    /* Allocate hook entry (reuse from free list if possible) */
+    HookEntry* entry = alloc_entry();
+    if (!entry) {
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return HOOK_ERROR_ALLOC_FAILED;
+    }
+
     entry->target = target;
     entry->on_enter = on_enter;
     entry->on_leave = on_leave;
@@ -414,10 +513,17 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
     entry->original_size = MIN_HOOK_SIZE;
 
-    /* Allocate and generate trampoline (relocated original instructions + jump back) */
-    size_t trampoline_alloc = 256;
-    entry->trampoline = hook_alloc(trampoline_alloc);
-    if (!entry->trampoline) return HOOK_ERROR_ALLOC_FAILED;
+    /* Allocate trampoline (reuse if available and large enough) */
+    if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
+        entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
+        entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
+    }
+    if (!entry->trampoline) {
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return HOOK_ERROR_ALLOC_FAILED;
+    }
 
     /* Relocate original instructions to trampoline */
     size_t relocated_size = hook_relocate_instructions(target, entry->trampoline, MIN_HOOK_SIZE);
@@ -426,36 +532,55 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     void* jump_back_target = (uint8_t*)target + MIN_HOOK_SIZE;
     int jump_result = hook_write_jump((uint8_t*)entry->trampoline + relocated_size, jump_back_target);
     if (jump_result < 0) {
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
         return jump_result;
     }
 
     /* Generate thunk code */
     size_t thunk_size = 0;
     void* thunk_mem = generate_attach_thunk(entry, on_enter, on_leave, user_data, &thunk_size);
-    if (!thunk_mem) return HOOK_ERROR_ALLOC_FAILED;
+    if (!thunk_mem) {
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return HOOK_ERROR_ALLOC_FAILED;
+    }
 
-    if (g_engine.stealth_mode) {
+    /* Tighten pool back to R-X before patching target */
+    pool_make_executable();
+
+    if (stealth) {
         /* Stealth mode: write jump to temp buffer, patch via wxshadow */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, thunk_mem);
         if (jump_result < 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
         for (int i = jump_result; i < MIN_HOOK_SIZE; i += 4) {
             *(uint32_t*)(jump_buf + i) = 0xD4200000 | (0xFFFF << 5); /* BRK #0xFFFF */
         }
         if (wxshadow_patch(target, jump_buf, MIN_HOOK_SIZE) != 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
         entry->stealth = 1;
     } else {
-        /* Normal mode: mprotect + direct write */
+        /* Normal mode: mprotect + direct write (Fix 1: 0x2000 for cross-page) */
         uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return HOOK_ERROR_MPROTECT_FAILED;
         }
         jump_result = hook_write_jump(target, thunk_mem);
         if (jump_result < 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
             return jump_result;
         }
         entry->stealth = 0;
@@ -463,13 +588,14 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
 
     /* Flush caches */
     hook_flush_cache(target, MIN_HOOK_SIZE);
-    hook_flush_cache(entry->trampoline, trampoline_alloc);
+    hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
     hook_flush_cache(thunk_mem, thunk_size);
 
     /* Add to list */
     entry->next = g_engine.hooks;
     g_engine.hooks = entry;
 
+    pthread_mutex_unlock(&g_engine.lock);
     return HOOK_OK;
 }
 
@@ -483,6 +609,8 @@ int hook_remove(void* target) {
         return HOOK_ERROR_INVALID_PARAM;
     }
 
+    pthread_mutex_lock(&g_engine.lock);
+
     HookEntry* prev = NULL;
     HookEntry* entry = g_engine.hooks;
 
@@ -492,44 +620,58 @@ int hook_remove(void* target) {
                 /* Stealth hook: release shadow pages to restore original view */
                 int rc = wxshadow_release(target, entry->original_size);
                 if (rc != 0) {
+                    pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
             } else {
                 /* Normal hook: restore original bytes via mprotect + memcpy */
                 uintptr_t page_start = (uintptr_t)target & ~0xFFF;
                 if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                    pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_MPROTECT_FAILED;
                 }
                 memcpy(target, entry->original_bytes, entry->original_size);
             }
             hook_flush_cache(target, entry->original_size);
 
-            /* Remove from list */
+            /* Remove from hook list */
             if (prev) {
                 prev->next = entry->next;
             } else {
                 g_engine.hooks = entry->next;
             }
 
-            /* Note: We don't free the entry memory (it's in our pool) */
+            /* Move to free list for reuse instead of discarding */
+            free_entry(entry);
+
+            pthread_mutex_unlock(&g_engine.lock);
             return HOOK_OK;
         }
         prev = entry;
         entry = entry->next;
     }
 
+    pthread_mutex_unlock(&g_engine.lock);
     return HOOK_ERROR_NOT_FOUND;
 }
 
 /* Get trampoline for hooked function */
 void* hook_get_trampoline(void* target) {
+    pthread_mutex_lock(&g_engine.lock);
     HookEntry* entry = find_hook(target);
-    return entry ? entry->trampoline : NULL;
+    void* result = entry ? entry->trampoline : NULL;
+    pthread_mutex_unlock(&g_engine.lock);
+    return result;
 }
 
 /* Cleanup all hooks */
 void hook_engine_cleanup(void) {
     if (!g_engine.initialized) return;
+
+    pthread_mutex_lock(&g_engine.lock);
+
+    /* Make pool writable for cleanup state reset */
+    pool_make_writable();
 
     /* Restore all hooks */
     HookEntry* entry = g_engine.hooks;
@@ -547,6 +689,10 @@ void hook_engine_cleanup(void) {
 
     /* Reset state */
     g_engine.hooks = NULL;
+    g_engine.free_list = NULL;
     g_engine.exec_mem_used = 0;
     g_engine.initialized = 0;
+
+    pthread_mutex_unlock(&g_engine.lock);
+    pthread_mutex_destroy(&g_engine.lock);
 }

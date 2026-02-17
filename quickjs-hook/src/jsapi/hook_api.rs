@@ -144,7 +144,8 @@ unsafe extern "C" fn hook_callback_wrapper(
     ffi::qjs_free_value(ctx, global);
 }
 
-/// hook(ptr, callback) - Install a hook at the given address
+/// hook(ptr, callback, stealth?) - Install a hook at the given address
+/// stealth: optional boolean, default false. If true, uses wxshadow for traceless hooking.
 unsafe extern "C" fn js_hook(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -152,11 +153,19 @@ unsafe extern "C" fn js_hook(
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return ffi::JS_ThrowTypeError(ctx, b"hook() requires 2 arguments\0".as_ptr() as *const _);
+        return ffi::JS_ThrowTypeError(ctx, b"hook() requires at least 2 arguments\0".as_ptr() as *const _);
     }
 
     let ptr_arg = JSValue(*argv);
     let callback_arg = JSValue(*argv.add(1));
+
+    // Get optional stealth flag (3rd argument, default false)
+    let stealth = if argc >= 3 {
+        let stealth_arg = JSValue(*argv.add(2));
+        stealth_arg.to_bool().unwrap_or(false)
+    } else {
+        false
+    };
 
     // Get the address
     let addr = match get_native_pointer_addr(ctx, ptr_arg) {
@@ -204,6 +213,7 @@ unsafe extern "C" fn js_hook(
         Some(hook_callback_wrapper),
         None, // No on_leave callback for now
         addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
+        if stealth { 1 } else { 0 },
     );
 
     if result != HOOK_OK {
@@ -269,44 +279,20 @@ unsafe extern "C" fn js_unhook(
     JSValue::bool(true).raw()
 }
 
-/// setStealthMode(enabled) - Enable or disable wxshadow stealth hooking
-unsafe extern "C" fn js_set_stealth_mode(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"setStealthMode() requires 1 argument\0".as_ptr() as *const _);
-    }
-
-    let arg = JSValue(*argv);
-    let enabled = arg.to_bool().unwrap_or(false);
-
-    hook_ffi::hook_set_stealth(if enabled { 1 } else { 0 });
-
-    JSValue::bool(enabled).raw()
-}
-
 /// Register hook API
 pub fn register_hook_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
     unsafe {
-        // Register hook()
+        // Register hook(ptr, callback, stealth?)
         let cname = CString::new("hook").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_hook), cname.as_ptr(), 2);
+        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_hook), cname.as_ptr(), 3);
         global.set_property(ctx.as_ptr(), "hook", JSValue(func_val));
 
         // Register unhook()
         let cname = CString::new("unhook").unwrap();
         let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_unhook), cname.as_ptr(), 1);
         global.set_property(ctx.as_ptr(), "unhook", JSValue(func_val));
-
-        // Register setStealthMode()
-        let cname = CString::new("setStealthMode").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_set_stealth_mode), cname.as_ptr(), 1);
-        global.set_property(ctx.as_ptr(), "setStealthMode", JSValue(func_val));
     }
 
     global.free(ctx.as_ptr());
