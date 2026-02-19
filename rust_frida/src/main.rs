@@ -20,7 +20,7 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
-use rustyline::{Context, Helper};
+use rustyline::{CompletionType, Config, Context, Helper};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IoSlice, Write};
@@ -1049,7 +1049,20 @@ impl Completer for JsReplCompleter {
 impl Hinter for JsReplCompleter {
     type Hint = String;
 }
-impl Highlighter for JsReplCompleter {}
+impl Highlighter for JsReplCompleter {
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        completion: CompletionType,
+    ) -> std::borrow::Cow<'c, str> {
+        if completion == CompletionType::List {
+            // Dark gray background + bright white text for list-mode candidates
+            std::borrow::Cow::Owned(format!("\x1b[48;5;238m\x1b[38;5;255m{}\x1b[0m", candidate))
+        } else {
+            std::borrow::Cow::Borrowed(candidate)
+        }
+    }
+}
 impl Validator for JsReplCompleter {}
 impl Helper for JsReplCompleter {}
 
@@ -1079,7 +1092,10 @@ fn run_js_repl(sender: &Sender<String>) {
 
     // Clone the sender so JsReplCompleter can own it
     let sender_clone = sender.clone();
-    let mut rl: Editor<JsReplCompleter, _> = match Editor::new() {
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
         Ok(e) => e,
         Err(e) => {
             log_error!("初始化 JS REPL 行编辑器失败: {}", e);
