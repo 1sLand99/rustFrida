@@ -178,11 +178,6 @@ impl ExecMem {
         Ok(())
     }
 
-    fn drop(&mut self) {
-        unsafe {
-            munmap(self.ptr as *mut _, self.size);
-        }
-    }
     pub fn current_addr(&self) -> usize {
         unsafe { self.ptr.add(self.used) as usize }
     }
@@ -209,6 +204,14 @@ impl ExecMem {
     }
     pub fn page_size(&self) -> usize {
         self.page_size
+    }
+}
+
+impl Drop for ExecMem {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr as *mut _, self.size);
+        }
     }
 }
 
@@ -668,7 +671,7 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
         .set(connect_socket().expect("wwb connect socket failed!!!"))
         .unwrap();
     let mut stream = GLOBAL_STREAM.get().unwrap();
-    let _ = stream.write("HELLO_AGENT".as_bytes()).unwrap();
+    let _ = stream.write("HELLO_AGENT\n".as_bytes()).unwrap();
     std::thread::sleep(Duration::from_secs(2));
     flush_cached_logs();
 
@@ -814,10 +817,14 @@ fn process_cmd(command: &str) {
         #[cfg(feature = "quickjs")]
         Some("jsclean") => {
             if !quickjs_loader::is_initialized() {
-                log_msg("[quickjs] JS 引擎未初始化\n".to_string());
+                if let Some(mut stream) = GLOBAL_STREAM.get() {
+                    let _ = stream.write_all("EVAL_ERR:[quickjs] JS 引擎未初始化\n".as_bytes());
+                }
             } else {
                 quickjs_loader::cleanup();
-                log_msg("[quickjs] Cleaned up\n".to_string());
+                if let Some(mut stream) = GLOBAL_STREAM.get() {
+                    let _ = stream.write_all(b"EVAL:cleaned up\n");
+                }
             }
         }
         #[cfg(feature = "quickjs")]

@@ -47,8 +47,11 @@ fn main() {
         log_warn!("继续注入可能导致多个 agent 并存，建议先终止旧会话");
     }
 
-    // 启动抽象套接字监听
-    let handle = start_socket_listener("rust_frida_socket");
+    // 启动抽象套接字监听（失败立即退出，不执行后续注入）
+    let handle = start_socket_listener("rust_frida_socket").unwrap_or_else(|e| {
+        log_error!("启动 socket 监听失败: {}", e);
+        std::process::exit(1);
+    });
 
     // 解析字符串覆盖参数（格式：name=value）
     let mut string_overrides = std::collections::HashMap::new();
@@ -96,11 +99,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    unsafe {
-        while !*(AGENT_STAT.read().unwrap()) {
-            sleep(1);
-            log_info!("等待 agent 连接...");
-        }
+    while !AGENT_STAT.load(Ordering::Acquire) {
+        unsafe { sleep(1) };
+        log_info!("等待 agent 连接...");
     }
     let sender = GLOBAL_SENDER.get().unwrap();
 
@@ -205,8 +206,10 @@ fn main() {
                 }
                 // Fix #1: loadjs/jseval/jsinit 都等待 EVAL:/EVAL_ERR: 响应并显示结果
                 // jsinit 也走 eval 等待，避免其 EVAL:initialized 响应污染后续 jseval 通道
-                let is_eval_cmd =
-                    line.starts_with("jseval ") || line.starts_with("loadjs ") || line == "jsinit";
+                let is_eval_cmd = line.starts_with("jseval ")
+                    || line.starts_with("loadjs ")
+                    || line == "jsinit"
+                    || line == "jsclean";
                 if is_eval_cmd {
                     eval_state().clear();
                 }
@@ -242,7 +245,7 @@ fn main() {
     }
 
     // 等待监听线程退出
-    handle.unwrap().join().unwrap();
+    handle.join().unwrap();
 
     // 清理资源
     let memfd = AGENT_MEMFD.load(Ordering::SeqCst);

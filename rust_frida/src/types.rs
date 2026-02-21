@@ -150,7 +150,7 @@ macro_rules! define_string_table {
 // 使用宏定义字符串表
 define_string_table!(
     (socket_name, b"rust_frida_socket"),
-    (hello_msg, b"HELLO_LOADER"),
+    (hello_msg, b"HELLO_LOADER\n"),
     (sym_name, b"hello_entry"),
     (pthread_err, b"pthreadded"),
     (dlsym_err, b"dlsymFail"),

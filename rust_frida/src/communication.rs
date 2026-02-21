@@ -2,14 +2,13 @@
 
 use libc::{bind, listen, sockaddr_un, socket, AF_UNIX, SOCK_STREAM};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
-use once_cell::unsync::Lazy;
-use std::io::{IoSlice, Read, Write};
+use std::io::{BufRead, BufReader, IoSlice, Write};
 use std::mem::{size_of_val, zeroed};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -109,7 +108,7 @@ pub(crate) fn eval_state() -> &'static SyncChannel<std::result::Result<String, S
 }
 
 pub(crate) static GLOBAL_SENDER: OnceLock<Sender<String>> = OnceLock::new();
-pub(crate) static mut AGENT_STAT: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
+pub(crate) static AGENT_STAT: AtomicBool = AtomicBool::new(false);
 
 /// 检查抽象 socket "rust_frida_socket" 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
 /// 在 start_socket_listener 之前调用，连接成功则说明已有 agent 会话。
@@ -150,95 +149,80 @@ pub(crate) fn send_fd_over_unix_socket(
     Ok(())
 }
 
-pub(crate) fn handle_socket_connection(mut stream: UnixStream) {
-    let mut buffer = [0; 1024];
-    while let Ok(size) = stream.read(&mut buffer) {
-        if size == 0 {
-            break;
+pub(crate) fn handle_socket_connection(stream: UnixStream) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF: connection closed
+            Ok(_) => {}
+            Err(e) => {
+                log_error!("读取连接失败: {}", e);
+                break;
+            }
         }
 
-        if let Ok(msg) = String::from_utf8(buffer[..size].to_vec()) {
-            let trimmed = msg.trim();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-            // 如果是 HELLO_LOADER，额外发送 memfd
-            if trimmed == "HELLO_LOADER" {
-                log_info!("{}", trimmed);
-                let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
-                if memfd >= 0 {
-                    if let Err(e) = send_fd_over_unix_socket(&stream, memfd) {
-                        log_error!("发送 memfd 失败: {}", e);
-                    }
-                } else {
-                    log_error!("memfd 无效，无法发送 agent.so");
+        if trimmed == "HELLO_LOADER" {
+            log_info!("{}", trimmed);
+            let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
+            if memfd >= 0 {
+                if let Err(e) = send_fd_over_unix_socket(reader.get_ref(), memfd) {
+                    log_error!("发送 memfd 失败: {}", e);
                 }
-            } else if trimmed == "HELLO_AGENT" {
-                log_success!("Agent 已连接");
-                STOP_LISTENER.store(true, Ordering::SeqCst);
-                let mut stream_clone = stream.try_clone().unwrap();
-                thread::spawn(move || {
-                    let (sd, rx) = channel();
-                    match GLOBAL_SENDER.set(sd) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            log_error!("GLOBAL_SENDER already set!");
-                            return;
-                        }
-                    }
-                    unsafe {
-                        *(AGENT_STAT.write().unwrap()) = true;
-                    }
-                    while let Ok(msg) = rx.recv() {
-                        match stream_clone.write_all(format!("{}\n", msg).as_bytes()) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                log_error!("stream 写入失败: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                });
-            } else if trimmed.contains("COMPLETE:") {
-                // COMPLETE: 响应可能包含多行候选项，保持整体处理
-                let complete_part = if let Some(pos) = trimmed.find("COMPLETE:") {
-                    // Log any lines that appear before COMPLETE:
-                    for line in trimmed[..pos].lines() {
-                        let l = line.trim();
-                        if !l.is_empty() {
-                            log_agent!("{}", l);
-                        }
-                    }
-                    &trimmed[pos + "COMPLETE:".len()..]
-                } else {
-                    ""
-                };
-                let candidates: Vec<String> = if complete_part.is_empty() {
-                    vec![]
-                } else {
-                    complete_part
-                        .lines()
-                        .map(|s| s.to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                };
-                complete_state().send(candidates);
             } else {
-                // 按行处理：EVAL_ERR:/EVAL: 路由到 eval_state，其余（含 console.log）显示到终端
-                for line in trimmed.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if line.starts_with("EVAL_ERR:") {
-                        // agent 侧用 \r 替换 \n 传输多行错误（含堆栈），此处还原
-                        let content = line["EVAL_ERR:".len()..].replace('\r', "\n");
-                        eval_state().send(Err(content));
-                    } else if line.starts_with("EVAL:") {
-                        eval_state().send(Ok(line["EVAL:".len()..].to_string()));
-                    } else {
-                        log_agent!("{}", line);
+                log_error!("memfd 无效，无法发送 agent.so");
+            }
+        } else if trimmed == "HELLO_AGENT" {
+            log_success!("Agent 已连接");
+            STOP_LISTENER.store(true, Ordering::SeqCst);
+            let mut stream_clone = reader.get_ref().try_clone().unwrap();
+            thread::spawn(move || {
+                let (sd, rx) = channel();
+                match GLOBAL_SENDER.set(sd) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        log_error!("GLOBAL_SENDER already set!");
+                        return;
                     }
                 }
-            }
+                AGENT_STAT.store(true, Ordering::Release);
+                while let Ok(msg) = rx.recv() {
+                    match stream_clone.write_all(format!("{}\n", msg).as_bytes()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log_error!("stream 写入失败: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        } else if let Some(complete_part) = trimmed.strip_prefix("COMPLETE:") {
+            // COMPLETE: 候选项以 \t 分隔（单行协议，避免多行截断问题）
+            let candidates: Vec<String> = if complete_part.is_empty() {
+                vec![]
+            } else {
+                complete_part
+                    .split('\t')
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            complete_state().send(candidates);
+        } else if trimmed.starts_with("EVAL_ERR:") {
+            // agent 侧用 \r 替换 \n 传输多行错误（含堆栈），此处还原
+            let content = trimmed["EVAL_ERR:".len()..].replace('\r', "\n");
+            eval_state().send(Err(content));
+        } else if trimmed.starts_with("EVAL:") {
+            eval_state().send(Ok(trimmed["EVAL:".len()..].to_string()));
+        } else {
+            log_agent!("{}", trimmed);
         }
     }
 }

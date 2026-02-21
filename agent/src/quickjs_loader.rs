@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-use crate::{log_msg, GLOBAL_STREAM};
+use crate::GLOBAL_STREAM;
 
 /// Executable memory for hooks
 static EXEC_MEM: OnceLock<ExecMemory> = OnceLock::new();
@@ -132,7 +132,7 @@ pub fn complete(prefix: &str) -> String {
         return String::new();
     }
     let candidates = complete_script(prefix);
-    candidates.join("\n")
+    candidates.join("\t")
 }
 
 /// 检查 JS 引擎是否已初始化
@@ -146,7 +146,6 @@ pub fn cleanup() {
     cleanup_engine(); // 销毁 JSEngine (context + runtime)
     cleanup_hooks(); // 清理所有 hooks
     cleanup_hook_engine(); // 清理 hook 引擎内存
-    log_msg("[quickjs] Cleanup complete\n".to_string());
 }
 
 #[cfg(test)]
