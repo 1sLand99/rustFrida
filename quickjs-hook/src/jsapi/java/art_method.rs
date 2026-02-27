@@ -33,6 +33,8 @@ pub(super) fn resolve_art_method(
         let cls = find_class_safe(env, class_name);
 
         if cls.is_null() {
+            // Defensive: ensure no pending exception leaks to caller
+            jni_check_exc(env);
             return Err(format!("FindClass('{}') failed", class_name));
         }
 
@@ -89,19 +91,26 @@ pub(super) unsafe fn read_entry_point(art_method: u64, offset: usize) -> u64 {
     std::ptr::read_volatile(ptr)
 }
 
-/// Modify ArtMethod access_flags_ for native hook conversion.
-/// Sets kAccNative, kAccCompileDontBother, kAccPreCompiled.
+/// Modify ArtMethod access_flags_ for native hook conversion (Frida-compatible).
+/// Sets kAccNative, kAccCompileDontBother.
 /// Clears flags incompatible with our native hook trampoline.
+///
+/// Frida also patches the ORIGINAL method's flags separately (two-method pattern),
+/// but since we modify the original in-place, we clear all fast-path flags here.
 pub(super) unsafe fn set_native_hook_flags(art_method: u64) {
     let ptr = (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32;
     let flags = std::ptr::read_volatile(ptr);
-    let new_flags = (flags | K_ACC_NATIVE | K_ACC_COMPILE_DONT_BOTHER | K_ACC_PRE_COMPILED)
-        & !(K_ACC_FAST_INTERP_TO_INTERP
-            | K_ACC_SINGLE_IMPLEMENTATION
-            | K_ACC_FAST_NATIVE
-            | K_ACC_CRITICAL_NATIVE
-            | K_ACC_SKIP_ACCESS_CHECKS
-            | K_ACC_NTERP_ENTRY_POINT_FAST_PATH);
+    // Match Frida's flag manipulation:
+    //   SET: kAccNative | kAccCompileDontBother
+    //   CLEAR: kAccCriticalNative | kAccFastNative(=kAccSkipAccessChecks) |
+    //          kAccNterpEntryPointFastPathFlag | kAccFastInterpreterToInterpreterInvoke |
+    //          kAccSingleImplementation
+    let new_flags = (flags | K_ACC_NATIVE | K_ACC_COMPILE_DONT_BOTHER)
+        & !(K_ACC_CRITICAL_NATIVE
+            | K_ACC_FAST_NATIVE  // also clears kAccSkipAccessChecks (same bit)
+            | K_ACC_NTERP_ENTRY_POINT_FAST_PATH
+            | K_ACC_FAST_INTERP_TO_INTERP
+            | K_ACC_SINGLE_IMPLEMENTATION);
     std::ptr::write_volatile(ptr, new_flags);
 }
 
@@ -381,8 +390,12 @@ pub(super) unsafe fn cache_fields_for_class(
             Ok(c) => c,
             Err(_) => continue,
         };
+        // IMPORTANT: Always clear pending exceptions before calling GetFieldID.
+        // GetFieldID will abort (SIGABRT) if there's already a pending exception.
+        jni_check_exc(env);
         let fid = get_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
-        if fid.is_null() || jni_check_exc(env) {
+        if fid.is_null() {
+            jni_check_exc(env); // Clear exception from failed GetFieldID
             continue;
         }
         field_map.insert(

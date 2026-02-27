@@ -15,27 +15,34 @@ use std::sync::Mutex;
 /// Offset of access_flags_ in ArtMethod
 pub(super) const ART_METHOD_ACCESS_FLAGS_OFFSET: usize = 4;
 
-/// Offset of data_ (native function pointer for native methods) in ArtMethod
-pub(super) const ART_METHOD_DATA_OFFSET: usize = 16;
+/// Get the data_ offset for a given entry_point offset.
+/// data_ and entry_point_ are adjacent in ArtMethod::PtrSizedFields:
+///   struct PtrSizedFields { data_: ptr, entry_point_from_quick_compiled_code_: ptr }
+/// So data_ is always at ep_offset - 8 (pointer size on ARM64).
+#[inline]
+pub(super) fn data_offset_for(ep_offset: usize) -> usize {
+    ep_offset - 8
+}
 
 /// kAccNative — marks method as native (ART uses JNI trampoline to call data_)
 pub(super) const K_ACC_NATIVE: u32 = 0x0100;
 /// kAccCompileDontBother — prevents JIT from recompiling the method
-pub(super) const K_ACC_COMPILE_DONT_BOTHER: u32 = 1 << 25;
-/// kAccPreCompiled — marks method as pre-compiled (Frida sets this)
-pub(super) const K_ACC_PRE_COMPILED: u32 = 1 << 24;
+/// API >= 27: 0x02000000, API 24-26: 0x01000000, API < 24: 0
+pub(super) const K_ACC_COMPILE_DONT_BOTHER: u32 = 0x02000000;
 /// kAccFastInterpreterToInterpreterInvoke — fast interpreter dispatch (must clear for native)
-pub(super) const K_ACC_FAST_INTERP_TO_INTERP: u32 = 1 << 30;
+pub(super) const K_ACC_FAST_INTERP_TO_INTERP: u32 = 0x40000000;
 /// kAccSingleImplementation — devirtualization optimization (must clear for hooked methods)
-pub(super) const K_ACC_SINGLE_IMPLEMENTATION: u32 = 1 << 28;
+pub(super) const K_ACC_SINGLE_IMPLEMENTATION: u32 = 0x08000000;
 /// kAccFastNative — fast JNI (@FastNative annotation, must clear for our hook)
+/// NOTE: same bit as kAccSkipAccessChecks (mutually exclusive: native vs non-native methods)
 pub(super) const K_ACC_FAST_NATIVE: u32 = 0x00080000;
 /// kAccCriticalNative — critical JNI (@CriticalNative, must clear)
 pub(super) const K_ACC_CRITICAL_NATIVE: u32 = 0x00200000;
 /// kAccSkipAccessChecks — skip access checks optimization (must clear)
-pub(super) const K_ACC_SKIP_ACCESS_CHECKS: u32 = 1 << 18;
+/// Same bit as kAccFastNative (0x00080000) — they share the bit, different interpretation
+pub(super) const K_ACC_SKIP_ACCESS_CHECKS: u32 = 0x00080000;
 /// kAccNterpEntryPointFastPath — nterp fast path (must clear for native conversion)
-pub(super) const K_ACC_NTERP_ENTRY_POINT_FAST_PATH: u32 = 1 << 22;
+pub(super) const K_ACC_NTERP_ENTRY_POINT_FAST_PATH: u32 = 0x00100000;
 
 /// Cached entry_point offset, determined at runtime.
 /// Android 12 emulator uses 24 (no separate data_ field, 32-byte ArtMethod).

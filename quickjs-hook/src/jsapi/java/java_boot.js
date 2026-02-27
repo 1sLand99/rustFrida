@@ -76,6 +76,16 @@
                     if (ctx.thisObj !== undefined) {
                         ctx.thisObj = _wrapJavaObj(ctx.thisObj, cls);
                     }
+                    // Wrap object args that have __jptr/__jclass as Proxy objects
+                    if (ctx.args) {
+                        for (var i = 0; i < ctx.args.length; i++) {
+                            var a = ctx.args[i];
+                            if (a !== null && typeof a === "object"
+                                && a.__jptr !== undefined) {
+                                ctx.args[i] = _wrapJavaObj(a.__jptr, a.__jclass);
+                            }
+                        }
+                    }
                     return userFn(ctx);
                 });
                 this._fn = fn;

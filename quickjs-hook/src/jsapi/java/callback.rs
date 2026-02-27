@@ -37,6 +37,10 @@ pub(super) struct JavaHookData {
     pub(super) method_key: String, // "class.method.sig" for lookup
     pub(super) is_static: bool,
     pub(super) param_count: usize,
+    // Per-parameter JNI type descriptors (e.g. ["I", "Ljava/lang/String;", "[B"])
+    pub(super) param_types: Vec<String>,
+    // Hooked class name (dot notation, for wrapping object args)
+    pub(super) class_name: String,
 }
 
 unsafe impl Send for JavaHookData {}
@@ -113,6 +117,46 @@ pub(super) fn count_jni_params(sig: &str) -> usize {
         count += 1;
     }
     count
+}
+
+/// Parse a JNI method signature into individual parameter type descriptors.
+/// "(ILjava/lang/String;[B)V" → ["I", "Ljava/lang/String;", "[B"]
+pub(super) fn parse_jni_param_types(sig: &str) -> Vec<String> {
+    let bytes = sig.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    // skip to '('
+    while i < bytes.len() && bytes[i] != b'(' {
+        i += 1;
+    }
+    i += 1; // skip '('
+    while i < bytes.len() && bytes[i] != b')' {
+        let start = i;
+        match bytes[i] {
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1; // skip ';'
+            }
+            b'[' => {
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'L' {
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else {
+                    i += 1; // primitive element
+                }
+            }
+            _ => i += 1, // primitive
+        }
+        result.push(String::from_utf8_lossy(&bytes[start..i]).to_string());
+    }
+    result
 }
 
 // ============================================================================
@@ -268,6 +312,98 @@ unsafe extern "C" fn js_call_original(
 }
 
 // ============================================================================
+// Argument marshalling — convert raw JNI register values to JS values
+// ============================================================================
+
+/// Convert a raw JNI argument (from register) to a JS value based on its JNI type descriptor.
+///
+/// Primitive types become JS numbers/booleans/bigints.
+/// String objects become JS strings (read via GetStringUTFChars).
+/// Other objects become wrapped `{__jptr, __jclass}` for Proxy-based field access.
+/// Falls back to BigUint64 if type info is unavailable.
+unsafe fn marshal_jni_arg_to_js(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    raw: u64,
+    type_sig: Option<&str>,
+) -> ffi::JSValue {
+    let sig = match type_sig {
+        Some(s) if !s.is_empty() => s,
+        _ => return ffi::JS_NewBigUint64(ctx, raw),
+    };
+
+    match sig.as_bytes()[0] {
+        b'Z' => JSValue::bool(raw != 0).raw(),
+        b'B' => JSValue::int(raw as i8 as i32).raw(),
+        b'C' => {
+            // char → JS string (single UTF-16 character)
+            let ch = std::char::from_u32(raw as u32).unwrap_or('\0');
+            let s = ch.to_string();
+            JSValue::string(ctx, &s).raw()
+        }
+        b'S' => JSValue::int(raw as i16 as i32).raw(),
+        b'I' => JSValue::int(raw as i32).raw(),
+        b'J' => ffi::JS_NewBigUint64(ctx, raw),
+        b'F' => {
+            // Float is passed as 32-bit IEEE 754 in the low 32 bits of the register
+            let f = f32::from_bits(raw as u32);
+            JSValue::float(f as f64).raw()
+        }
+        b'D' => {
+            // Double is passed as 64-bit IEEE 754 in the register
+            let d = f64::from_bits(raw);
+            JSValue::float(d).raw()
+        }
+        b'L' | b'[' => {
+            // Object or array — raw is a jobject local ref
+            let obj = raw as *mut std::ffi::c_void;
+            if obj.is_null() {
+                return ffi::qjs_null();
+            }
+
+            // String → read as JS string
+            if sig == "Ljava/lang/String;" {
+                let get_str: GetStringUtfCharsFn =
+                    jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+                let rel_str: ReleaseStringUtfCharsFn =
+                    jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+
+                let chars = get_str(env, obj, std::ptr::null_mut());
+                if !chars.is_null() {
+                    let s = std::ffi::CStr::from_ptr(chars)
+                        .to_string_lossy()
+                        .to_string();
+                    rel_str(env, obj, chars);
+                    return JSValue::string(ctx, &s).raw();
+                }
+                // GetStringUTFChars failed — fall through to wrapped object
+                jni_check_exc(env);
+            }
+
+            // Other object → wrap as {__jptr, __jclass} for Proxy field access
+            let wrapper = ffi::JS_NewObject(ctx);
+            let wrapper_val = JSValue(wrapper);
+
+            let ptr_val = ffi::JS_NewBigUint64(ctx, raw);
+            wrapper_val.set_property(ctx, "__jptr", JSValue(ptr_val));
+
+            // Extract class name from signature: "Ljava/lang/Foo;" → "java.lang.Foo"
+            let type_name = if sig.starts_with('L') && sig.ends_with(';') {
+                sig[1..sig.len() - 1].replace('/', ".")
+            } else {
+                // Array or unknown — use raw signature
+                sig.replace('/', ".")
+            };
+            let cls_val = JSValue::string(ctx, &type_name);
+            wrapper_val.set_property(ctx, "__jclass", cls_val);
+
+            wrapper
+        }
+        _ => ffi::JS_NewBigUint64(ctx, raw),
+    }
+}
+
+// ============================================================================
 // Hook callback (runs in hooked thread, called by ART JNI trampoline)
 // ============================================================================
 
@@ -290,7 +426,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     let art_method_addr = user_data as u64;
 
     // Copy callback data then release lock (same pattern as hook_api.rs)
-    let (ctx_usize, callback_bytes, is_static, param_count, return_type) = {
+    let (ctx_usize, callback_bytes, is_static, param_count, return_type, param_types) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -304,7 +440,8 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             None => return,
         };
         (hook_data.ctx, hook_data.callback_bytes, hook_data.is_static,
-         hook_data.param_count, hook_data.return_type)
+         hook_data.param_count, hook_data.return_type,
+         hook_data.param_types.clone())
     }; // lock released
 
     // Serialize JS access via JS_ENGINE mutex (blocking — don't silently drop callbacks)
@@ -335,15 +472,17 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
     }
 
-    // Add args[] — x2-x7 contain Java arguments (both instance and static)
+    // Add args[] — x2-x7 contain Java arguments, marshalled to JS values by JNI type.
+    // JNIEnv* from x0 for reading String/Object args.
     {
+        let env: JniEnv = hook_ctx.x[0] as JniEnv;
         let arr = ffi::JS_NewArray(ctx);
         for i in 0..param_count {
             let reg_idx = 2 + i; // JNI: args always start at x2
-            if reg_idx < 8 { // x2-x7 = first 6 args
-                let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[reg_idx]);
-                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
-            }
+            if reg_idx >= 8 { break; } // x2-x7 = first 6 args
+            let raw = hook_ctx.x[reg_idx];
+            let val = marshal_jni_arg_to_js(ctx, env, raw, param_types.get(i).map(|s| s.as_str()));
+            ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
         }
         JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
     }

@@ -110,7 +110,7 @@ pub fn cleanup_java_hooks() {
                         as *mut u32;
                     std::ptr::write_volatile(flags_ptr, data.original_access_flags);
 
-                    let data_ptr = (data.art_method as usize + ART_METHOD_DATA_OFFSET) as *mut u64;
+                    let data_ptr = (data.art_method as usize + data_offset_for(ep_offset)) as *mut u64;
                     std::ptr::write_volatile(data_ptr, data.original_data);
 
                     let ep_ptr = (data.art_method as usize + ep_offset) as *mut u64;

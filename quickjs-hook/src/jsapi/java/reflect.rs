@@ -253,6 +253,10 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
 /// `class_name` can use either `.` or `/` notation.
 /// Returns a JNI local ref to the jclass, or null on failure.
 pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
+    // Clear any stale exception before calling FindClass.
+    // ART's FindClass asserts no pending exception — calling it with one → SIGABRT.
+    jni_check_exc(env);
+
     let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
 
     // Try FindClass with '/' notation
@@ -300,7 +304,14 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
                           args.as_ptr() as *const std::ffi::c_void);
     delete_local_ref(env, jstr);
 
-    if result.is_null() || jni_check_exc(env) {
+    // CRITICAL: Always clear pending exceptions before returning.
+    // loadClass() throws ClassNotFoundException for unknown classes — if we return
+    // without clearing, the next JNI call triggers ART's AssertNoPendingException → SIGABRT.
+    if result.is_null() {
+        jni_check_exc(env);
+        return std::ptr::null_mut();
+    }
+    if jni_check_exc(env) {
         return std::ptr::null_mut();
     }
 
@@ -349,6 +360,10 @@ pub(super) unsafe fn enumerate_methods(
 ) -> Result<Vec<MethodInfo>, String> {
     use std::ffi::CStr;
     use std::ptr;
+
+    // Defensive: clear any stale JNI exception before we start.
+    // Prevents SIGABRT if a prior operation left an uncleared exception.
+    jni_check_exc(env);
 
     let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
     let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
